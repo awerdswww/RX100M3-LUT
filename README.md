@@ -16,15 +16,22 @@
 | 变焦杆 | ✅ | 原生逻辑（App 不干预） |
 | **Fn 键参数调节** | ✅ | 曝光补偿/光圈/快门/ISO/白平衡 |
 | **回看键对比** | ✅ | 按住临时关 LUT，松开恢复 |
-| 退出 App | ⚠️ | **偶发相机重启**（ISP 状态污染，固件级缺陷） |
-| 照片元数据 | ❌ | 已禁用（与索尼媒体库竞态导致重启） |
+| 退出 App | ✅ | 正常（见下方「退出重启」的修复说明） |
+| 照片元数据 | ❌ | 已禁用（JPEG 打标会写坏照片，见下） |
 
 ## 已知问题（RX100M3 特有）
 
-1. **退出重启**：应用 LUT 后退出 App（或关机），相机可能重启一次。重启后正常，LUT 效果消失（ISP 复位）。这是 RX100M3 固件对 `setExtendedGammaTable` 的实现缺陷——写入后 ISP 状态被污染，原生界面接管时初始化失败。无解，只能接受。
-2. **控制环光圈不可调**：HAL 硬映射到变焦马达，`incrementAperture()`/`adjustAperture()` 被忽略（A/M 档也一样）。要调光圈只能进原生菜单。
-3. **退出后二次进入卡死**：App 退出后 LUT 缓存目录状态异常，再次进入会卡在"正在计算新增LUT"。**Workaround**：重启相机后再进。
-4. **C 键无映射**：RX100M3 的 C 键（自定义键）系统未派发按键事件，无法使用。
+1. **二次进入卡在 LUT 计算**：App 退出后不重启相机，再次进入会卡在「正在计算新增LUT」。**Workaround**：用完一次想再进，先重启相机（关机再开）再打开 App。
+2. **控制环光圈不可调**：控制环在 HAL 层被硬映射到变焦，`incrementAperture()`/`adjustAperture()` 调用被忽略（A/M 档也一样）。光圈只能在原生界面调。Fn 参数模式里的光圈/快门项对 RX100M3 实际不生效，保留仅为其他机型参考。
+3. **C 键无映射**：C 键（自定义键）系统不向 App 派发按键事件，无法使用。
+4. **曝光补偿项未实测生效**：Fn 模式走 `setPictureControlExposureShift`，写入无报错但实际曝光变化未确认，待进一步验证。
+
+## 修复记录（相对上游 v0.3.2）
+
+- **退出重启（已修复）**：病根是 `GammaTable` 泄漏——它是 `DeviceBuffer`（硬件缓冲区），官方用法要求 `setExtendedGammaTable(table)` 之后立刻 `table.release()`，上游漏调了。A6000 资源池大没暴露，RX100M3 上应用几次 LUT 后缓冲区耗尽，退出时原生界面接管即崩。补上后退出正常。参考资料：[up209d/Bible.md](https://github.com/up209d/open-memories-app-ai)（索尼官方应用逆向文档）。
+- **照片打标已禁用**：原版拍照后原地重写 JPEG 插 COM 标签，RX100M3 上与机内写盘竞态会产出无法显示的损坏照片，故 `PHOTO_TAGGING_ENABLED=false` 关闭。LUT 效果烧在像素里，关闭不影响成片色彩，只是照片不再内嵌 LUT 名称标签。
+- **应用 LUT 后变焦失灵（已修复）**：`writeMatrix` 的 `setParameters` 全量回写会把 HAL 的变焦驱动状态重置，修复为写前保存 `zoomDriveType`、写后恢复。
+- **按键表适配**：RX100M3 实测 scancode：Fn=520、回看=207、左右=105/106；变焦杆 610/611、控制环 648/649 不消费（原生变焦依赖它们）。
 
 ## 按键映射（RX100M3）
 
@@ -55,12 +62,12 @@
 | 白平衡 LB | -100~+100 | 琥珀-蓝偏移 |
 | 白平衡 CC | -100~+100 | 绿-品红偏移 |
 
-## 技术要点（RX100M3 差异）
+## 技术要点（RX100M3 实测结论）
 
-- **伽马表容量**：`getSize()` 实测 2048 字节（1024 点×16bit），与 A6000 相同——README 里"表深可能有差异"的警告对 RX100M3 不成立
-- **GammaTable 必须 release**：`createGammaTable()` 后必须 `table.release()`，否则硬件缓冲区泄漏导致 HAL 崩溃（A6000 资源多撑得住，RX100M3 漏几次就崩）
-- **退出清理**：RX100M3 上 `setExtendedGammaTable(null)` 解绑也会崩，只能写恒等内容（线性伽马+恒等矩阵）保留绑定状态
-- **写盘护栏**：拍照后需等 `StoreImageCompleteListener` 回调 + 文件稳定才能退出清理，否则打断索尼写盘导致数据库损坏+重启
+- **伽马表容量**：`getSize()` 实测 2048 字节（1024 点×16bit），与 A6000 相同——上游 README 里"表深可能有差异"的警告对 RX100M3 不成立
+- **GammaTable 必须 release**：`createGammaTable()` 后必须 `table.release()`（官方 Liveview Grading 用法），否则硬件缓冲区泄漏——这是 RX100M3 上退出/关机时相机重启的根因，补上后正常
+- **写盘护栏**：拍照后等 `StoreImageCompleteListener` 回调 + 文件大小稳定后再允许退出清理，避免打断机内写盘
+- **变焦/光圈控制**：`startZoom`/`adjustAperture` 均被 HAL 拒绝（`PowerZoomListener` 报 STATUS_UNAVAILABLE），马达控制权在系统侧，App 只能让给原生逻辑
 
 ## 构建与安装
 
