@@ -72,9 +72,14 @@
 
 **注意**：RX100M3 的 USB 模式必须切到 **MTP** 才能装应用。
 
+## LUT 素材
+
+本仓库 `luts/` 目录内置 25 个转换自 [shenmintao/V-Log-Alchemy](https://github.com/shenmintao/V-Log-Alchemy)（Apache-2.0）的风格 LUT——富士胶片模拟、柯达/富士电影印片、哈苏、徕卡、ARRI、RED 全系，已做 sRGB→V-Log 输入适配，可直接拷入 SD 卡 `/LUTS/` 使用。各款特点详见 [docs/LUTS.md](docs/LUTS.md)。
+
 ## 致谢
 
 - [starshine09074-ui/A6000-LUT](https://github.com/starshine09074-ui/A6000-LUT) — 上游项目，A6000 原始实现
+- [shenmintao/V-Log-Alchemy](https://github.com/shenmintao/V-Log-Alchemy) — 跨品牌色彩科学 LUT（本仓库 `luts/` 素材来源，Apache-2.0）
 - [ma1co/Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE) — PMCA 安装通道逆向
 - [up209d/open-memories-app-ai](https://github.com/up209d/open-memories-app-ai) — `Bible.md`：索尼官方应用逆向的 `CameraEx` API 目录
 - [YahiaAngelo/Film-Luts](https://github.com/YahiaAngelo/Film-Luts) — 胶片模拟 LUT 素材
