@@ -70,6 +70,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static final int SCAN_DIAL2_CCW = 529;
     private static final int SCAN_UP = 103;
     private static final int SCAN_DOWN = 108;
+    private static final int SCAN_LEFT = 105;
+    private static final int SCAN_RIGHT = 106;
+    // RX100M3 实测（2026-08-24）：Fn=520，回看=207，C 键无映射（系统未派发）
+    private static final int SCAN_FN = 520;        // Fn：进/出参数调节模式
+    private static final int SCAN_REVIEW = 207;    // 回看：临时关 LUT 对比原图
+    // RX100M3 的变焦杆(610/611)与控制环(648/649)不在此处理：
+    // 索尼原生 sys.camera 直接响应这些键驱动变焦马达，App 消费与否不影响它。
+    // 我们曾尝试 startZoom/adjustAperture 均被 HAL 拒（powerzoom status=2
+    // UNAVAILABLE，马达控制权在系统侧），故全部让给原生逻辑。
 
     private SurfaceHolder surfaceHolder;
     private TextView topBar, lutListView, bottomHint;
@@ -88,10 +97,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     // 最近一次 AF 状态（锁定态判断用，v0.2 可重复对焦）
     private volatile int lastAfStatus = 0;
 
+    // RX100M3：光圈/变焦由原生控制，App 只挂监听做 HUD 显示（F 值 / 焦距位置）
+
+    // Fn 参数调节模式（v0.5）：Fn 键进入/退出，方向键上下选参数，左右调值。
+    // 参数项：曝光补偿/光圈/快门/ISO/白平衡偏移。全走 ParametersModifier 标准通道。
+    private boolean paramMode = false;
+    private int paramIndex = 0; // 当前选中的参数项
+    private static final int PARAM_EV = 0;
+    private static final int PARAM_APERTURE = 1;
+    private static final int PARAM_SHUTTER = 2;
+    private static final int PARAM_ISO = 3;
+    private static final int PARAM_WB_LB = 4; // 白平衡 琥珀-蓝
+    private static final int PARAM_WB_CC = 5; // 白平衡 绿-品红
+    private static final int PARAM_COUNT = 6;
+    private int paramEv = 0;      // 曝光补偿（1/3 EV 步进）
+    private int paramAperture = -1; // 光圈（F 值×100，-1=未初始化）
+    private int paramShutter = 0;  // 快门（编码值）
+    private int paramIso = 0;      // ISO（感光度值）
+    private int paramWbLb = 0;     // 白平衡 LB（-100~+100）
+    private int paramWbCc = 0;     // 白平衡 CC（-100~+100）
+
     // 退出清理线程：onPause 不做任何相机/HAL 调用（2.3 dalvik + 索尼驱动上
     // UI 线程同步清理会卡死并触发系统看门狗重启拍摄框架），全部丢给它；
     // finishing 时另有 2.5s 看门狗无条件杀进程兜底
     private volatile Thread shutdownThread;
+
+    // 退出清理完成标志：看门狗据此决定是否兜底杀进程（v0.3.3——正常退出不杀，
+    // RX100M3 上杀进程与 DA 交还竞态会带崩拍摄框架导致相机重启）
+    private volatile boolean cleanupDone = true;
+
+    // RX100M3：索尼 StoreImageCompleteListener 回调时间戳（0=未收到）。
+    // 文件写稳后索尼还有缩略图/数据库等收尾，此信号用于诊断真实完成点。
+    private volatile long storeCompleteAt = 0;
 
     // 取景帧心跳看门狗：startPreview 后 2.5s 无任何帧信号（索尼 Analize 流 /
     // 一次性预览帧回调）判定黑取景，自动 stop/start 重试 → reopen 逐级自救
@@ -241,6 +278,63 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     });
                 }
             });
+            // RX100M3：光圈监听（原生变焦时 F 值会变，HUD 显示回执）
+            try {
+                camera.setApertureChangeListener(new CameraEx.ApertureChangeListener() {
+                    public void onApertureChange(CameraEx.ApertureInfo info, CameraEx c) {
+                        final String s = "光圈 F" + (info.currentAperture / 100.0f);
+                        Log.i(TAG, "aperture changed: " + s);
+                        mainHandler.post(new Runnable() {
+                            public void run() {
+                                topBar.setText(s);
+                            }
+                        });
+                        mainHandler.postDelayed(new Runnable() {
+                            public void run() {
+                                refreshTopBar();
+                            }
+                        }, 1500);
+                    }
+                });
+            } catch (Throwable t) {
+                Log.i(TAG, "setApertureChangeListener n/a: " + t);
+            }
+            // RX100M3：索尼"图像存储完成"权威信号（诊断 + 供护栏参考）。
+            // 文件写稳 ≠ 索尼收尾完（缩略图/数据库/RAW 处理更久）。
+            try {
+                camera.setStoreImageCompleteListener(new CameraEx.StoreImageCompleteListener() {
+                    public void onDone(int status, CameraEx.StoreImageInfo info, CameraEx c) {
+                        storeCompleteAt = System.currentTimeMillis();
+                        Log.i(TAG, "store image complete status=" + status);
+                        prepLog("store complete status=" + status);
+                    }
+                });
+            } catch (Throwable t) {
+                Log.i(TAG, "setStoreImageCompleteListener n/a: " + t);
+            }
+            // RX100M3：变焦位置监听（原生控制环变焦时 HUD 显示焦距）
+            try {
+                camera.setZoomChangeListener(new CameraEx.ZoomChangeListener() {
+                    public void onChanged(CameraEx.ZoomInfo info, CameraEx c) {
+                        final String s = "变焦 " + info.opticalPosition
+                                + "/" + info.opticalMagnification
+                                + (info.stopped ? " 停" : "");
+                        Log.i(TAG, "zoom changed: " + s);
+                        mainHandler.post(new Runnable() {
+                            public void run() {
+                                topBar.setText(s);
+                            }
+                        });
+                        mainHandler.postDelayed(new Runnable() {
+                            public void run() {
+                                refreshTopBar();
+                            }
+                        }, 1500);
+                    }
+                });
+            } catch (Throwable t) {
+                Log.i(TAG, "setZoomChangeListener n/a: " + t);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "CameraEx.open failed", t);
             prepLog("CameraEx.open failed " + t);
@@ -309,6 +403,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                             break;
                         }
                     }
+                    Log.w(TAG, "exit watchdog deadline reached");
+                    // 清理已完成：绝不杀进程（RX100M3 上杀进程会带崩 DA 交还，
+                    // 相机重启）。只有清理真卡死（HAL 挂起、fd 放不出）才杀。
+                    if (cleanupDone) {
+                        Log.i(TAG, "exit watchdog: cleanup done, no kill");
+                        prepLog("watchdog skip (cleanup done)");
+                        return;
+                    }
                     Log.w(TAG, "exit watchdog fired, kill process");
                     prepLog("exit watchdog fired");
                     android.os.Process.killProcess(android.os.Process.myPid());
@@ -335,11 +437,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         long t0 = System.currentTimeMillis();
         Log.i(TAG, "shutdown begin");
         prepLog("shutdown begin");
-        // capture 在途闩锁：拍照后立刻 MENU 退出时，驱动 drain/写盘/打标可能
-        // 未完，此时 stopPreview+release 会 wedge 相机服务（Pro 实测 stopPreview
-        // 阻塞 2943ms）。有界等待 ≤12s 让闩锁先清空，超时照常走（看门狗顺延兜底）。
+        cleanupDone = false;
+        // capture 在途闩锁：拍照后立刻 MENU 退出时，驱动 drain/写盘/护栏可能
+        // 未完（RX100M3 写盘护栏最长 ~13s），此时 stopPreview+release 会打断
+        // 索尼写入 → 数据库损坏 → 重启。有界等待 ≤16s 让闩锁先清空。
         long w0 = System.currentTimeMillis();
-        while (captureDraining && System.currentTimeMillis() - w0 < 12000) {
+        while (captureDraining && System.currentTimeMillis() - w0 < 16000) {
             Log.i(TAG, "waiting capture drain +" + rel(w0) + "ms");
             prepLog("waiting capture drain " + rel(w0) + "ms");
             try {
@@ -349,7 +452,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
         }
         if (captureDraining) {
-            Log.e(TAG, "capture drain timeout 12s, proceed anyway");
+            Log.e(TAG, "capture drain timeout 16s, proceed anyway");
             prepLog("capture drain TIMEOUT");
         } else if (System.currentTimeMillis() - w0 > 0) {
             Log.i(TAG, "capture drain done +" + rel(w0) + "ms");
@@ -359,11 +462,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         camLock.lock(); // 后台线程可等；卡死由 2.5s 看门狗/进程退出兜底
         prepLog("shutdown lock acquired +" + rel(t0) + "ms");
         try {
-            // 退出前清掉伽马管线，让机内应用接手时 ISP 是干净状态。
-            // writePipeline 内部会再拿 camLock——ReentrantLock 可重入，安全。
+            // RX100M3：先拔掉所有 native→Java 回调（Zoom/Aperture/Shutter…），
+            // 再清管线/释放。原生变焦工作后这些回调持续在飞；System.exit 杀掉
+            // JVM 时若 native 事件线程正在回调，JNI 崩溃会带崩相机服务，
+            // 表现为按 MENU 退出后相机自动重启。
             if (camera != null) {
-                writePipeline(null);
-                Log.i(TAG, "pipeline cleared @shutdown +" + rel(t0) + "ms");
+                // clearListeners() 是 private，只能逐个置 null 注销
+                try {
+                    camera.setZoomChangeListener(null);
+                    camera.setApertureChangeListener(null);
+                    camera.setPowerZoomListener(null);
+                    camera.setAutoFocusStartListener(null);
+                    camera.setAutoFocusDoneListener(null);
+                    camera.setShutterListener(null);
+                    Log.i(TAG, "listeners cleared @shutdown");
+                } catch (Throwable t) {
+                    Log.i(TAG, "listener unregister n/a: " + t);
+                }
+                // v0.3.5：退出清理改为 SD 卡可配（/LUTS/EXITCLR.TXT）。
+                // 模式：NONE=完全不清 / LINEAR=线性表+恒等矩阵 / GAMMA=仅线性表 /
+                //       MATRIX=仅恒等矩阵 / NULL=先停预览后 setGamma(null) 解绑。
+                // 缺省 NULL（实测：NONE/线性清都崩——毒药在应用时埋下，
+                // 残留绑定态在原生界面接管时爆雷；正确做法是解绑）。
+                String clrMode = readExitClearMode();
+                Log.i(TAG, "exit clear mode=" + clrMode);
+                prepLog("exit clear mode=" + clrMode);
+                if (!"NONE".equals(clrMode)) {
+                    clearPipelineForExit(clrMode);
+                }
+                Log.i(TAG, "pipeline clear done @shutdown +" + rel(t0) + "ms");
+                try {
+                    Thread.sleep(1500); // 沉降：异步参数提交落地
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
                 if (wasPreviewing) {
                     try {
                         Log.i(TAG, "stopPreview @shutdown");
@@ -386,13 +518,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             camLock.unlock();
         }
         previewStarted = false;
+        cleanupDone = true; // 看门狗凭此判断：清理已完成就绝不杀进程
         Log.i(TAG, "shutdown done +" + rel(t0) + "ms");
         prepLog("shutdown done " + rel(t0) + "ms");
         if (exitAfter) {
-            // 204MB 内存设备：彻底杀掉，退出即还内存（原在 onDestroy，
-            // 现在挪到清理完成后；卡死路径由 2.5s 看门狗 killProcess）
-            Log.i(TAG, "process exit");
-            System.exit(0);
+            // v0.3.3：不再 System.exit。RX100M3 上退出杀进程（System.exit/
+            // killProcess）恰逢 DA 显示交还、原生界面开相机，框架把进程死亡
+            // 当致命错 → 相机重启+数据库修复（实测两次清理均干净完成后仍重启）。
+            // 相机已 release、fd 已还，空进程留给系统缓存回收即可。
+            Log.i(TAG, "exit: cleanup complete, process left alive");
+            prepLog("exit complete (alive)");
         }
     }
 
@@ -878,7 +1013,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             return;
         }
         String s;
-        if (cubeFiles.isEmpty()) {
+        if (paramMode) {
+            s = paramLabel() + "  " + paramValue();
+        } else if (cubeFiles.isEmpty()) {
             s = "SD卡 /LUTS 下未发现 .cube 文件";
         } else if (appliedIndex == 0) {
             s = "未应用 LUT";
@@ -886,6 +1023,151 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             s = displayName(appliedIndex) + "   强度 " + intensity + "%";
         }
         topBar.setText(s);
+    }
+
+    /** Fn 参数模式：进入/退出。 */
+    private void toggleParamMode() {
+        paramMode = !paramMode;
+        if (paramMode) {
+            browsing = false; // 退出 LUT 浏览
+            refreshListView();
+            // 初始化参数当前值（从相机读）
+            initParamValues();
+        }
+        refreshTopBar();
+        Log.i(TAG, "param mode " + (paramMode ? "ON" : "OFF"));
+        prepLog("param mode " + (paramMode ? "on" : "off"));
+    }
+
+    /** 参数模式：当前参数项名称。 */
+    private String paramLabel() {
+        switch (paramIndex) {
+            case PARAM_EV: return "曝光补偿";
+            case PARAM_APERTURE: return "光圈";
+            case PARAM_SHUTTER: return "快门";
+            case PARAM_ISO: return "ISO";
+            case PARAM_WB_LB: return "白平衡LB";
+            case PARAM_WB_CC: return "白平衡CC";
+            default: return "?";
+        }
+    }
+
+    /** 参数模式：当前参数项值。 */
+    private String paramValue() {
+        switch (paramIndex) {
+            case PARAM_EV:
+                int whole = paramEv / 3;
+                int frac = Math.abs(paramEv % 3);
+                return (paramEv >= 0 ? "+" : "") + whole + (frac == 0 ? "" : frac == 1 ? ".3" : ".7") + " EV";
+            case PARAM_APERTURE:
+                return paramAperture > 0 ? "F" + (paramAperture / 100.0f) : "F--";
+            case PARAM_SHUTTER:
+                return "SS " + paramShutter;
+            case PARAM_ISO:
+                return "ISO " + paramIso;
+            case PARAM_WB_LB:
+                return "LB " + (paramWbLb >= 0 ? "+" : "") + paramWbLb;
+            case PARAM_WB_CC:
+                return "CC " + (paramWbCc >= 0 ? "+" : "") + paramWbCc;
+            default: return "";
+        }
+    }
+
+    /** 从相机读取当前参数值。 */
+    private void initParamValues() {
+        if (camera == null) {
+            return;
+        }
+        if (!camLock.tryLock()) {
+            return;
+        }
+        try {
+            Camera cam = camera.getNormalCamera();
+            Camera.Parameters p = cam.getParameters();
+            CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
+            try {
+                paramAperture = mod.getAperture();
+            } catch (Throwable t) { paramAperture = -1; }
+            try {
+                paramIso = mod.getISOSensitivity();
+            } catch (Throwable t) { paramIso = 0; }
+            // 快门/EV/WB 没有 getter，用默认值
+        } catch (Throwable t) {
+            Log.e(TAG, "initParamValues failed", t);
+        } finally {
+            camLock.unlock();
+        }
+    }
+
+    /** 调整当前参数。delta=±1（步进）。
+     *  注意：RX100M3 的 CameraEx 上光圈/快门用 increment/decrement（步进），
+     *  ParametersModifier 上只有 setISOSensitivity/setWhiteBalanceShift 可用。 */
+    private void adjustParam(int delta) {
+        if (camera == null || pausing) {
+            return;
+        }
+        if (!camLock.tryLock()) {
+            Log.w(TAG, "adjustParam: camLock busy, skip");
+            return;
+        }
+        try {
+            Camera cam = camera.getNormalCamera();
+            Camera.Parameters p = cam.getParameters();
+            CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
+            switch (paramIndex) {
+                case PARAM_EV:
+                    paramEv += delta;
+                    // RX100M3 无 setExposureCompensation，用 PictureControlExposureShift
+                    mod.setPictureControlExposureShift(paramEv);
+                    break;
+                case PARAM_APERTURE:
+                    // CameraEx 直接调 increment/decrement（步进）
+                    if (delta > 0) {
+                        camera.incrementAperture();
+                    } else {
+                        camera.decrementAperture();
+                    }
+                    // 回读当前值（ApertureChangeListener 会更新 paramAperture）
+                    break;
+                case PARAM_SHUTTER:
+                    if (delta > 0) {
+                        camera.incrementShutterSpeed();
+                    } else {
+                        camera.decrementShutterSpeed();
+                    }
+                    break;
+                case PARAM_ISO:
+                    // ISO 步进：100→125→160→200→250→320→400→500→640→800→1000→1250→1600→2000→2500→3200→4000→5000→6400→8000→10000→12800→16000→20000→25600
+                    int[] isoSteps = {100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800, 16000, 20000, 25600};
+                    int idx = 0;
+                    for (int i = 0; i < isoSteps.length; i++) {
+                        if (isoSteps[i] == paramIso) { idx = i; break; }
+                    }
+                    idx = Math.max(0, Math.min(isoSteps.length - 1, idx + delta));
+                    paramIso = isoSteps[idx];
+                    mod.setISOSensitivity(paramIso);
+                    break;
+                case PARAM_WB_LB:
+                    paramWbLb = Math.max(-100, Math.min(100, paramWbLb + delta));
+                    mod.setWhiteBalanceShiftLB(paramWbLb);
+                    break;
+                case PARAM_WB_CC:
+                    paramWbCc = Math.max(-100, Math.min(100, paramWbCc + delta));
+                    mod.setWhiteBalanceShiftCC(paramWbCc);
+                    break;
+            }
+            // 光圈/快门走 CameraEx 直接调，不需要 setParameters
+            if (paramIndex != PARAM_APERTURE && paramIndex != PARAM_SHUTTER) {
+                cam.setParameters(p);
+            }
+            refreshTopBar();
+            Log.i(TAG, "adjustParam " + paramLabel() + " delta=" + delta);
+        } catch (Throwable t) {
+            Log.e(TAG, "adjustParam failed", t);
+            prepLog("adjustParam fail " + t);
+        } finally {
+            camLock.unlock();
+        }
     }
 
     private void refreshListView() {
@@ -1014,14 +1296,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 }
                 CameraEx.GammaTable table = camera.createGammaTable();
                 table.setPictureEffectGammaForceOff(true);
-                byte[] buf = new byte[2048];
-                for (int i = 0; i < 1024; i++) {
-                    int v = params.gamma[i];
+                // RX100M3 表深探测：伽马表实际字节容量（A6000=2048=1024点×2B，
+                // RX100M3 可能不同——getSize() 只在绑定后的表上有效）。
+                int bufSize = table.getSize();
+                int points = bufSize / 2; // 每点 2 字节
+                if (points <= 0 || points > 4096) {
+                    points = 1024; // 探测异常兜底
+                }
+                Log.i(TAG, "gamma table size=" + bufSize + "B points=" + points);
+                prepLog("gamma table size=" + bufSize + " points=" + points);
+                // 按真实容量写入：1024 点源数据按比例重采样/截断到表深。
+                // 写超出表容量会写脏 HAL 邻接内存——RX100M3 退出重启的病根。
+                byte[] buf = new byte[bufSize];
+                for (int i = 0; i < points; i++) {
+                    int src = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
+                    int v = params.gamma[src];
                     buf[2 * i] = (byte) (v & 0xff);
                     buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
                 }
                 table.write(new ByteArrayInputStream(buf));
                 camera.setExtendedGammaTable(table);
+                table.release(); // DeviceBuffer 硬件缓冲区必须显式释放——
+                                  // 官方 Liveview Grading 的用法（Bible.md）。
+                                  // 不 release 会泄漏硬件缓冲区，RX100M3 资源少，
+                                  // 泄漏几次后 HAL 状态脏 → 退出时原生界面接管崩。
                 writeMatrix(params.matrix);
                 Log.i(TAG, "pipeline written");
             } catch (Throwable t) {
@@ -1037,8 +1335,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         Camera cam = camera.getNormalCamera();
         Camera.Parameters p = cam.getParameters();
         CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
+        // RX100M3：setParameters 全量回写会把 HAL 的变焦驱动状态重置，
+        // 导致原生控制环变焦失灵（应用 LUT 后转环没反应）。
+        // 先记住当前 zoomDriveType，写完矩阵后恢复回去。
+        String savedZoomDrive = null;
+        try {
+            savedZoomDrive = mod.getZoomDriveType();
+        } catch (Throwable t) {
+            Log.i(TAG, "getZoomDriveType n/a: " + t);
+        }
         mod.setRGBMatrix(m);
         cam.setParameters(p);
+        if (savedZoomDrive != null) {
+            try {
+                Camera.Parameters p2 = cam.getParameters();
+                CameraEx.ParametersModifier mod2 = camera.createParametersModifier(p2);
+                String now = mod2.getZoomDriveType();
+                if (!savedZoomDrive.equals(now)) {
+                    mod2.setZoomDriveType(savedZoomDrive);
+                    cam.setParameters(p2);
+                    Log.i(TAG, "zoomDriveType restored: " + savedZoomDrive
+                            + " (was " + now + ")");
+                    prepLog("zoomDrive restore " + savedZoomDrive + " was " + now);
+                }
+            } catch (Throwable t) {
+                Log.i(TAG, "zoomDriveType restore n/a: " + t);
+                prepLog("zoomDrive restore fail " + t);
+            }
+        }
     }
 
     private void applyIntensity() {
@@ -1046,6 +1370,104 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             writePipeline(baseParams.withIntensity(intensity));
         }
         refreshTopBar();
+    }
+
+    /** 读 /LUTS/EXITCLR.TXT 的退出清理模式（8.3 合规文件名）。
+     *  NONE / LINEAR / GAMMA / MATRIX / NULL，缺省 NULL。 */
+    private static String readExitClearMode() {
+        try {
+            File f = new File(LUT_DIR, "EXITCLR.TXT");
+            if (!f.isFile()) {
+                return "NULL";
+            }
+            FileInputStream in = new FileInputStream(f);
+            try {
+                byte[] b = new byte[(int) f.length()];
+                int n = in.read(b);
+                String s = new String(b, 0, n > 0 ? n : 0, "UTF-8").trim().toUpperCase();
+                s = s.split("\\s+")[0];
+                if (s.equals("NONE") || s.equals("GAMMA") || s.equals("MATRIX")
+                        || s.equals("NULL") || s.equals("LINEAR")) {
+                    return s;
+                }
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+        }
+        return "LINEAR"; // 缺省：内容恒等（实测 NULL/NONE 都崩）
+    }
+
+    /** 退出专用管线清理（v0.3.5，模式化）：按 clrMode 决定清法。
+     *  LINEAR（缺省）：内容写恒等直通（伽马 0..1023 线性 + 矩阵恒等），
+     *      绑定保留，不 setGamma(null)——原生界面接手时看到的是"已绑定但
+     *      内容中性"的状态，它可安全重新配置。
+     *  NULL=先停预览再 setGamma(null) 解绑（实测崩）/
+     *  NONE=完全不清（实测也崩，残留状态毒）/ GAMMA=仅线性伽马 / MATRIX=仅恒等矩阵。 */
+    private void clearPipelineForExit(String clrMode) {
+        if ("NULL".equals(clrMode)) {
+            try {
+                Log.i(TAG, "exit clear: stop preview first");
+                camera.getNormalCamera().stopPreview();
+            } catch (Throwable t) {
+                Log.e(TAG, "exit stopPreview failed", t);
+            }
+            try {
+                camera.setExtendedGammaTable(null); // 解绑（内容无关紧要，状态复位）
+                Log.i(TAG, "exit clear: gamma unbound (null)");
+                prepLog("exit clear unbind");
+            } catch (Throwable t) {
+                Log.e(TAG, "gamma unbind failed", t);
+            }
+            return; // 矩阵不动——原生界面会重新配置
+        }
+        boolean doGamma = "LINEAR".equals(clrMode) || "GAMMA".equals(clrMode);
+        boolean doMatrix = "LINEAR".equals(clrMode) || "MATRIX".equals(clrMode);
+        if (doGamma) {
+            // 恒等伽马表：按表实际容量写直通值（RX100M3 表深可能与 A6000 不同，
+            // 写超容量会写脏 HAL 内存）
+            try {
+                CameraEx.GammaTable table = camera.createGammaTable();
+                table.setPictureEffectGammaForceOff(true);
+                int bufSize = table.getSize();
+                int points = bufSize / 2;
+                if (points <= 0 || points > 4096) {
+                    points = 1024;
+                }
+                byte[] buf = new byte[bufSize];
+                for (int i = 0; i < points; i++) {
+                    int v = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
+                    buf[2 * i] = (byte) (v & 0xff);
+                    buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+                }
+                table.write(new ByteArrayInputStream(buf));
+                camera.setExtendedGammaTable(table);
+                table.release(); // DeviceBuffer 必须释放，见 writePipeline 注释
+                Log.i(TAG, "exit clear: linear gamma written (" + points + "pts)");
+                prepLog("exit clear linear gamma pts=" + points);
+            } catch (Throwable t) {
+                Log.e(TAG, "linear gamma clear failed", t);
+                prepLog("linear clear fail " + t);
+            }
+        } else {
+            prepLog("exit clear skip gamma");
+        }
+        if (doMatrix) {
+            // 恒等矩阵（单次 setParameters，不恢复 zoomDrive）
+            try {
+                Camera cam = camera.getNormalCamera();
+                Camera.Parameters p = cam.getParameters();
+                camera.createParametersModifier(p)
+                        .setRGBMatrix(new int[]{1024, 0, 0, 0, 1024, 0, 0, 0, 1024});
+                cam.setParameters(p);
+                Log.i(TAG, "exit clear: identity matrix written");
+                prepLog("exit clear matrix");
+            } catch (Throwable t) {
+                Log.e(TAG, "identity matrix clear failed", t);
+            }
+        } else {
+            prepLog("exit clear skip matrix");
+        }
     }
 
     // ---------------- 拍照 ----------------
@@ -1086,6 +1508,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             takingPicture = true;
             captureDraining = true;
+            storeCompleteAt = 0; // 新一次拍照，重置存储完成信号
             Log.i(TAG, "capture drain begin (shutter)");
             prepLog("capture drain begin");
             camera.burstableTakePicture();
@@ -1128,47 +1551,70 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     // ---------------- 成片 LUT 标记 ----------------
 
-    /** 拍照后延迟扫 DCIM 最新文件：JPEG 插 COM 段，ARW 写 XMP sidecar。 */
+    // RX100M3 固件 1.20：拍照后原地重写 JPEG（插 COM 标签）与索尼媒体库
+    // 写入存在竞态——文件大小稳定 ≠ 索尼数据库写完。实测导致照片损坏
+    // （无法显示）+「修复数据」+ 退出交接时媒体服务崩溃整机重启。
+    // A6000 时序宽可容忍；RX100M3 上必须关。LUT 效果烧在像素里，
+    // 关掉只是照片里不再嵌 "CUSTOM LUT: 名称 强度%" 文字标签。
+    private static final boolean PHOTO_TAGGING_ENABLED = false;
+
+    /** 拍照后 1.5s 起：先当写盘护栏（等索尼把照片+媒体库写完，只读不碰文件），
+     *  再视开关打标。护栏必须无条件执行——RX100M3 实测索尼写盘最长 ~10s，
+     *  不等就退出（release）会打断其写入 → 数据库损坏 → 整机重启。 */
     private void scheduleTagging() {
-        if (appliedIndex <= 0) {
-            return;
-        }
-        final String label = displayName(appliedIndex) + " " + intensity + "%";
+        final String label = (PHOTO_TAGGING_ENABLED && appliedIndex > 0)
+                ? displayName(appliedIndex) + " " + intensity + "%" : null;
         worker.postDelayed(new Runnable() {
             public void run() {
-                tagNewestPhoto(label);
+                barrierAndTag(label);
             }
         }, 1500);
     }
 
-    private void tagNewestPhoto(String label) {
+    /** 写盘护栏 + 可选打标。闩锁（captureDraining）由 onShutter 的 1600ms
+     *  尾任务在本任务之后串行复位，即护栏走完才放行退出清理。 */
+    private void barrierAndTag(String label) {
         try {
             File newest = findNewestPhoto(DCIM_DIR);
             if (newest == null) {
                 return;
             }
-            // 只处理 30 秒内的新文件，避免标记旧照片
+            // 只关注 30 秒内的新文件；太旧说明索尼早就写完了
             if (System.currentTimeMillis() - newest.lastModified() > 30000) {
-                Log.i(TAG, "newest photo too old, skip tagging");
+                Log.i(TAG, "newest photo old, barrier skip");
                 return;
             }
-            String path = newest.getPath();
-            if (taggedFiles.contains(path)) {
-                return;
+            boolean stable = waitFileStable(newest);
+            // 文件写稳后索尼还有内部收尾（缩略图/媒体库/RAW 处理），
+            // 实测仅等文件稳定仍会在退出时打断它 → 重启。追加固定余量，
+            // 若索尼的 store-complete 回调已到则可提前结束。
+            long graceEnd = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < graceEnd) {
+                if (storeCompleteAt > 0
+                        && System.currentTimeMillis() - storeCompleteAt > 1500) {
+                    break; // 回调到达且过了 1.5s，索尼收尾完
+                }
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+            Log.i(TAG, "write barrier done: " + newest.getName()
+                    + " stable=" + stable
+                    + " storeCb=" + (storeCompleteAt > 0 ? "yes" : "no"));
+            prepLog("write barrier " + (stable ? "ok" : "timeout")
+                    + " storeCb=" + (storeCompleteAt > 0 ? "y" : "n"));
+            if (label == null || !stable || taggedFiles.contains(newest.getPath())) {
+                return; // 护栏模式下或未稳定：到此为止，不动文件
             }
             String n = newest.getName().toUpperCase();
             if (n.endsWith(".JPG")) {
-                // 机内写盘慢，等文件写完再动，否则会得到截断 JPEG
-                if (!waitFileStable(newest)) {
-                    Log.w(TAG, "file still growing, give up tagging: "
-                            + newest.getName());
-                    return;
-                }
                 insertJpegComment(newest, "CUSTOM LUT: " + label);
             } else {
                 writeXmpSidecar(newest, "CUSTOM LUT: " + label);
             }
-            taggedFiles.add(path);
+            taggedFiles.add(newest.getPath());
             Log.i(TAG, "tagged " + newest.getName() + " : " + label);
         } catch (Throwable t) {
             Log.e(TAG, "tagNewestPhoto failed", t);
@@ -1512,7 +1958,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             return true;
         }
+        // RX100M3：Fn 键（520）进/出参数调节模式，回看键（207）临时关 LUT 对比
+        if (scan == SCAN_FN) {
+            toggleParamMode();
+            return true;
+        }
+        if (scan == SCAN_REVIEW) {
+            // 回看键：临时关 LUT（应用 0% 强度），松开恢复
+            if (appliedIndex > 0) {
+                requestApply(0); // 切到 OFF
+                Log.i(TAG, "review: temp LUT off");
+            }
+            return true;
+        }
         if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
+            if (paramMode) {
+                paramMode = false; // 中央键退出参数模式
+                refreshTopBar();
+                return true;
+            }
             if (browsing) {
                 browsing = false; // 选定，收起列表
                 refreshListView();
@@ -1522,6 +1986,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 refreshListView();
             }
             return true;
+        }
+        // Fn 参数模式：方向键上下选参数项，左右调值
+        if (paramMode) {
+            if (scan == SCAN_UP || scan == SCAN_DIAL1_CCW) {
+                paramIndex = (paramIndex + PARAM_COUNT - 1) % PARAM_COUNT;
+                refreshTopBar();
+                return true;
+            }
+            if (scan == SCAN_DOWN || scan == SCAN_DIAL1_CW) {
+                paramIndex = (paramIndex + 1) % PARAM_COUNT;
+                refreshTopBar();
+                return true;
+            }
+            // 左右调值（RX100M3 实测：左=105，右=106）
+            if (scan == SCAN_DIAL2_CCW || scan == SCAN_LEFT) {
+                adjustParam(-1);
+                return true;
+            }
+            if (scan == SCAN_DIAL2_CW || scan == SCAN_RIGHT) {
+                adjustParam(1);
+                return true;
+            }
+            return true; // 参数模式下吞掉其余键，防误触 LUT 浏览
         }
         boolean prev = (scan == SCAN_DIAL1_CCW || scan == SCAN_UP);
         boolean next = (scan == SCAN_DIAL1_CW || scan == SCAN_DOWN);
@@ -1552,11 +2039,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         int scan = event.getScanCode();
         int code = event.getKeyCode();
+        // RX100M3：回看键松开恢复 LUT（如果之前被临时关了）
+        if (scan == SCAN_REVIEW) {
+            if (appliedIndex == 0 && browsing) {
+                // 当前是 OFF 但 browsing 状态还在（被临时关的），恢复之前的选择
+                // 简单处理：重新应用当前 selection
+                requestApply(selection);
+                Log.i(TAG, "review: restore LUT");
+            }
+            return true;
+        }
         if (scan == SCAN_MENU || scan == SCAN_DELETE || scan == SCAN_S1 || scan == SCAN_S2
                 || scan == SCAN_S1_UP
                 || scan == SCAN_DIAL1_CW || scan == SCAN_DIAL1_CCW
                 || scan == SCAN_DIAL2_CW || scan == SCAN_DIAL2_CCW
                 || scan == SCAN_UP || scan == SCAN_DOWN
+                || scan == SCAN_FN || scan == SCAN_REVIEW
                 || code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_DEL
                 || code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
                 || code == 0) {
@@ -1564,6 +2062,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
         return super.onKeyUp(keyCode, event);
     }
+
+    // RX100M3 变焦杆(610/611)与控制环(648/649)的处理已全部移除：
+    // 索尼原生 sys.camera 直接消费这些键驱动变焦，App 侧 startZoom/adjustAperture
+    // 均被 HAL 拒绝（powerzoom status=2 UNAVAILABLE），原生接管反而是唯一能用的路径。
+    // 控制环（648/649）的 keyUp 也不消费，让原生逻辑处理变焦停止。
 
     /** 浏览中移动选择后 400ms 防抖预览。 */
     private void debouncePreview() {
@@ -1577,8 +2080,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }, 400);
     }
 
-    /** LVG 的正统退出：先 DAConnectionManager.finish() 让系统接管显示。 */
-    private void exitProperly() {
+    // 退出状态：exiting 防 MENU 重复触发；displayHandedBack 保证交还显示只做一次
+    private boolean exiting = false;
+    private boolean displayHandedBack = false;
+
+    /** 交还显示给系统（幂等）：DAConnectionManager.finish + finish。 */
+    private void handBackDisplay() {
+        if (displayHandedBack) {
+            return;
+        }
+        displayHandedBack = true;
         try {
             Class<?> c = Class.forName("android.app.DAConnectionManager");
             Object mgr = c.getDeclaredConstructor(android.content.Context.class).newInstance(this);
@@ -1587,5 +2098,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             Log.e(TAG, "DAConnectionManager.finish() failed", t);
         }
         finish();
+    }
+
+    /** LVG 的正统退出，但顺序反转：先异步清完相机（拔监听/清管线/release），
+     *  再交还显示。反过来（先 DA finish 再清理）的话，系统会立刻把相机收回给
+     *  原生拍摄界面，清理线程和原生抢 CameraEx，RX100M3 上驱动打架 → 相机重启。
+     *  清理卡死 3s 兜底强走（后续 onPause 的看门狗会 killProcess 收尾）。 */
+    private void exitProperly() {
+        if (exiting) {
+            return;
+        }
+        exiting = true;
+        topBar.setText("退出中…");
+        pausing = true; // 汇聚器立即停手，别在清理中途又碰相机
+        mainHandler.removeCallbacks(previewCheck);
+        final boolean wasPreviewing = previewStarted;
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                handBackDisplay(); // 兜底：拍照后护栏最长 ~13s+清理，15s 必交还
+            }
+        }, 15000);
+        Thread t = new Thread("sonylut-preexit") {
+            public void run() {
+                shutdownCamera(false, wasPreviewing); // 只清理不杀进程
+                mainHandler.post(new Runnable() {
+                    public void run() {
+                        handBackDisplay(); // 清理完成，正常交还
+                    }
+                });
+            }
+        };
+        t.start();
     }
 }

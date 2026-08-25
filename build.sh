@@ -8,7 +8,7 @@
 set -e
 
 SDK=${ANDROID_SDK_ROOT:?请先设置 ANDROID_SDK_ROOT，见 docs/BUILD.md}
-STUBS=${SONY_STUBS:-./stubs/sony_cameraex_stubs.jar}
+STUBS=${SONY_STUBS:-./stubs/sony_cameraex_stubs_rx100m3.jar}
 AAPT=$SDK/build-tools/25.0.2/aapt
 DX=$SDK/build-tools/25.0.2/dx
 ANDROID_JAR=$SDK/platforms/android-10/android.jar
