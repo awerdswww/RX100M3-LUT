@@ -23,6 +23,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -51,6 +52,9 @@ import java.util.concurrent.locks.ReentrantLock;
 public class MainActivity extends Activity implements SurfaceHolder.Callback,
         CameraEx.ShutterListener {
     private static final String TAG = "SonyLut";
+    // 会话计数（static：同进程二次进入时 >1 —— "暖启动"即老进程驻留，是
+    // 第二次进入变慢的头号嫌疑，用它和 PREPLOG 时间线对账）
+    private static int sSessionNo = 0;
     private static final File LUT_DIR = new File(
             Environment.getExternalStorageDirectory(), "LUTS");
     private static final File CACHE_DIR = new File(LUT_DIR, "LUTCACHE");
@@ -112,10 +116,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static final int PARAM_COUNT = 6;
     private int paramEv = 0;      // 曝光补偿（1/3 EV 步进）
     private int paramAperture = -1; // 光圈（F 值×100，-1=未初始化）
-    private int paramShutter = 0;  // 快门（编码值）
+    private String paramShutter = "--"; // 快门（getShutterSpeed 返回 Pair<分子,分母>，
+                                        // 渲染为 "1/500" 样式；"--"=未知）
     private int paramIso = 0;      // ISO（感光度值）
-    private int paramWbLb = 0;     // 白平衡 LB（-100~+100）
-    private int paramWbCc = 0;     // 白平衡 CC（-100~+100）
+    private int paramWbLb = 0;     // 白平衡 LB（范围以运行时 min/max 为准）
+    private int paramWbCc = 0;     // 白平衡 CC（同上）
+
+    // 参数能力/范围快照（进入参数模式时从相机探测一次；探测失败回落保守缺省）。
+    // stub 已确认 isPictureControlExposureShiftSupported/isWhiteBalanceShiftModeSupported
+    // 等支持位方法真实存在（.tmp_stub/api_catalog.txt）。
+    private boolean paramSupEv;     // 本机是否声明支持 picture-control-exposure-shift
+    private boolean paramSupWbMode; // 本机是否支持 white-balance-shift-mode（LB/CC 的前置总开关）
+    private int paramWbLbMin = -9, paramWbLbMax = 9; // 探测失败时的保守缺省（固件典型量级，
+                                                     // 真 LB 范围以 getMin/MaxWhiteBalanceShiftLB 为准）
+    private int paramWbCcMin = -9, paramWbCcMax = 9;
+    private static final int[] ISO_LEGACY_STEPS = {100, 125, 160, 200, 250, 320, 400, 500, 640,
+            800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800,
+            16000, 20000, 25600};
+    private int[] isoStepsSupported = null; // 相机报告的 ISO 档位（升序）；null=未探测到，用上表兜底
 
     // 退出清理线程：onPause 不做任何相机/HAL 调用（2.3 dalvik + 索尼驱动上
     // UI 线程同步清理会卡死并触发系统看门狗重启拍摄框架），全部丢给它；
@@ -150,8 +168,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private int appliedIndex = 0;    // 当前生效
     private int intensity = 100;
     private boolean browsing = false;
+    private int lutIndexBeforeReview = -1; // 回看键临时关 LUT 前的应用索引（>0=临时关闭中）
     private LutParams baseParams;    // 当前 LUT 的 100% 参数（OFF 时为 null）
     private int applySeq = 0;        // 应用请求序号（防抖）
+
+    // 单次绑定复用的伽马表（v0.5.4 起禁循环建绑；v0.5.7 升级为 static——
+    // 暖进程二次进入时直接复用上一 Activity 的表对象，连领养都省掉）。
+    // RX100M3 驱动实测脾气（两轮日志对账）：
+    //   - 已绑定的表内容可反复改写且即时生效；
+    //   - "createGammaTable+setExtendedGammaTable" 在经历过 release+相机重开
+    //     之后再次执行必永久挂死 → 只允许在开机周期内首个相机回合做一次。
+    private static CameraEx.GammaTable sBoundGamma;
+    private static byte[] sIdentityBuf; // 与表同容量的恒等内容缓存（临时关用）
 
     // 启动预计算状态
     private boolean startupComputing = false;
@@ -169,7 +197,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Log.i(TAG, "onCreate");
+        sSessionNo++;
+        Log.i(TAG, "onCreate session#" + sSessionNo
+                + " pid=" + android.os.Process.myPid());
+        prepLog("entry #" + sSessionNo + (sSessionNo > 1 ? " WARM(同进程!)" : " cold")
+                + " pid=" + android.os.Process.myPid()
+                + " " + heapStat());
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
                 WindowManager.LayoutParams.FLAG_FULLSCREEN);
@@ -278,10 +311,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     });
                 }
             });
-            // RX100M3：光圈监听（原生变焦时 F 值会变，HUD 显示回执）
+            // RX100M3：光圈监听（v0.5.5 起这是唯一可信的光圈真值来源——
+            // modifier.getAperture() 恒返回 F1.8 不反映实时 iris）。
+            // 直接回写 paramAperture，HUD 用它绘制参数模式显示。
             try {
                 camera.setApertureChangeListener(new CameraEx.ApertureChangeListener() {
                     public void onApertureChange(CameraEx.ApertureInfo info, CameraEx c) {
+                        paramAperture = info.currentAperture;
                         final String s = "光圈 F" + (info.currentAperture / 100.0f);
                         Log.i(TAG, "aperture changed: " + s);
                         mainHandler.post(new Runnable() {
@@ -335,6 +371,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             } catch (Throwable t) {
                 Log.i(TAG, "setZoomChangeListener n/a: " + t);
             }
+            // RX100M3：快门速度监听（v0.5.5：真值回写 paramShutter，
+            // 与光圈同理——modifier 读回在原生联动下不可信）
+            try {
+                camera.setShutterSpeedChangeListener(new CameraEx.ShutterSpeedChangeListener() {
+                    public void onShutterSpeedChange(CameraEx.ShutterSpeedInfo info, CameraEx c) {
+                        if (info != null) {
+                            paramShutter = info.currentShutterSpeed_n + "/"
+                                    + info.currentShutterSpeed_d;
+                            final String s = "快门 " + paramShutter;
+                            mainHandler.post(new Runnable() {
+                                public void run() {
+                                    topBar.setText(s);
+                                }
+                            });
+                            mainHandler.postDelayed(new Runnable() {
+                                public void run() {
+                                    refreshTopBar();
+                                }
+                            }, 1500);
+                        }
+                    }
+                });
+            } catch (Throwable t) {
+                Log.i(TAG, "setShutterSpeedChangeListener n/a: " + t);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "CameraEx.open failed", t);
             prepLog("CameraEx.open failed " + t);
@@ -351,7 +412,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         refreshTopBar();
         // 恢复之前应用的 LUT（从播放界面返回等场景）
         if (appliedIndex > 0 && baseParams != null) {
-            writePipeline(baseParams.withIntensity(intensity));
+            writePipeline(effectiveParams(baseParams));
         }
     }
 
@@ -480,10 +541,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     Log.i(TAG, "listener unregister n/a: " + t);
                 }
                 // v0.3.5：退出清理改为 SD 卡可配（/LUTS/EXITCLR.TXT）。
-                // 模式：NONE=完全不清 / LINEAR=线性表+恒等矩阵 / GAMMA=仅线性表 /
-                //       MATRIX=仅恒等矩阵 / NULL=先停预览后 setGamma(null) 解绑。
-                // 缺省 NULL（实测：NONE/线性清都崩——毒药在应用时埋下，
-                // 残留绑定态在原生界面接管时爆雷；正确做法是解绑）。
+                // 模式：NONE=完全不清 / LINEAR=中性表+恒等矩阵 / GAMMA=仅中性表 /
+                //       MATRIX=仅恒等矩阵 / NULL=停预览但保留绑定。
+                // 生效缺省：无文件=NULL，解析失败=LINEAR 兜底。
+                // v0.5.4：所有模式均已禁止解绑/新建伽马表（HAL 死点）。
                 String clrMode = readExitClearMode();
                 Log.i(TAG, "exit clear mode=" + clrMode);
                 prepLog("exit clear mode=" + clrMode);
@@ -512,6 +573,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 } catch (Throwable t) {
                     Log.e(TAG, "camera release failed", t);
                 }
+                // v0.5.7：release 挪到相机句柄关闭之后（停流后摘缓冲的温和时序），
+                // 防退出重启依然成立；下回合进 App 走 ADOPT 复用 HAL 旧绑定绕开 create 死区
+                releaseBoundGamma("shutdown");
                 camera = null;
             }
         } finally {
@@ -810,6 +874,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                         } catch (Throwable t) {
                             Log.e(TAG, "kick release failed", t);
                         }
+                        releaseBoundGamma("kick"); // 句柄换新前同样放掉缓冲区记账
                         camera = null;
                         Log.i(TAG, "kick: camera released, reopen");
                     }
@@ -840,12 +905,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         sendBroadcast(intent);
     }
 
-    /** 持久化尸检日志：冻机后也能从 SD 卡 PREPLOG.TXT 读出卡在哪一步。 */
+    /** 持久化尸检日志：冻机后也能从 SD 卡 PREPLOG.TXT 读出卡在哪一步。
+     *  超 64KB 时把当前文件改名保留为 PREPLOG.OLD 再起新档——
+     *  此前直接整文件重写，曾把参数测试的现场记录全部抹掉。 */
     private static void prepLog(String msg) {
         try {
             CACHE_DIR.mkdirs();
             File f = new File(CACHE_DIR, "PREPLOG.TXT");
-            boolean append = f.isFile() && f.length() <= 65536; // 超 64KB 覆盖重写
+            boolean append = true;
+            if (f.isFile() && f.length() > 65536) {
+                File old = new File(CACHE_DIR, "PREPLOG.OLD");
+                old.delete();
+                f.renameTo(old);
+                Log.i(TAG, "preplog rotated to PREPLOG.OLD");
+                append = false;
+            }
             FileOutputStream fos = new FileOutputStream(f, append);
             try {
                 fos.write((System.currentTimeMillis() + " " + msg + "\n")
@@ -858,17 +932,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
     }
 
+    /** Dalvik 堆快照（KB）：暖启动变慢的 GC 压力假说直接看这两个数。 */
+    private static String heapStat() {
+        Runtime rt = Runtime.getRuntime();
+        long free = rt.freeMemory() / 1024;
+        long total = rt.totalMemory() / 1024;
+        return "heap " + free + "/" + total + "KB free";
+    }
+
     // ---------------- 启动预计算 ----------------
 
-    /** 检查所有 cube 是否都有新鲜缓存；缺的进预计算流程，算完再进拍照界面。 */
+    /** 检查所有 cube 是否都有新鲜缓存；缺的进预计算流程，算完再进拍照界面。
+     *  v0.5.1：miss 名单与原因记入 PREPLOG——"二次进入卡在计算"此前零诊断。 */
     private void checkStartupCache() {
         final List<File> missing = new ArrayList<File>();
+        StringBuilder missWhy = new StringBuilder();
         for (File f : cubeFiles) {
             File cache = new File(CACHE_DIR, shortName83(f.getName()) + ".LTC");
-            if (!(cache.isFile() && cache.lastModified() >= f.lastModified())) {
+            StringBuilder why = new StringBuilder();
+            if (!LutParams.isFresh(cache, f, why)) {
                 missing.add(f);
+                missWhy.append(' ').append(shortName83(f.getName())).append(why);
             }
         }
+        Log.i(TAG, "cache check: " + cubeFiles.size() + " cubes, "
+                + missing.size() + " missing");
+        prepLog("cachecheck cubes=" + cubeFiles.size()
+                + " missing=" + missing.size() + missWhy);
         if (missing.isEmpty()) {
             Log.i(TAG, "all LUT caches fresh, skip precompute");
             return;
@@ -897,6 +987,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 writeLutList();
                 mainHandler.post(new Runnable() {
                     public void run() {
+                        prepLog("startup precompute end "
+                                + startupDone + "/" + startupTotal);
                         startupComputing = false;
                         lutListView.setVisibility(View.GONE);
                         bottomHint.setVisibility(View.VISIBLE);
@@ -960,6 +1052,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
         });
         Log.i(TAG, "found " + cubeFiles.size() + " cubes in " + LUT_DIR);
+        prepLog("scan cubes=" + cubeFiles.size());
         refreshTopBar();
     }
 
@@ -1062,6 +1155,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             case PARAM_APERTURE:
                 return paramAperture > 0 ? "F" + (paramAperture / 100.0f) : "F--";
             case PARAM_SHUTTER:
+                // Pair<分子,分母> 渲染为 1/500 样式；调节走原生 increment/decrement
                 return "SS " + paramShutter;
             case PARAM_ISO:
                 return "ISO " + paramIso;
@@ -1073,12 +1167,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
     }
 
-    /** 从相机读取当前参数值。 */
+    /** 从相机读取当前参数值与本机能力（进入参数模式时调用）。
+     *  全部读写真实值：HUD 显示的从此是相机状态，不是本地猜测。
+     *  每项独立 try/catch：某项不支持不影响其它项。 */
     private void initParamValues() {
+        paramSupEv = false;
+        paramSupWbMode = false;
         if (camera == null) {
             return;
         }
         if (!camLock.tryLock()) {
+            prepLog("initParams busy");
             return;
         }
         try {
@@ -1087,21 +1186,113 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
             try {
                 paramAperture = mod.getAperture();
-            } catch (Throwable t) { paramAperture = -1; }
+            } catch (Throwable t) {
+                paramAperture = -1;
+            }
+            // 快门：Pair<分子,分母>（如 1/500）；调节走 increment/decrement 原生步进
+            try {
+                android.util.Pair ss = mod.getShutterSpeed();
+                paramShutter = (ss != null && ss.first instanceof Integer
+                        && ss.second instanceof Integer)
+                        ? ((Integer) ss.first).intValue() + "/"
+                          + ((Integer) ss.second).intValue()
+                        : "--";
+            } catch (Throwable t) {
+                paramShutter = "--";
+            }
             try {
                 paramIso = mod.getISOSensitivity();
-            } catch (Throwable t) { paramIso = 0; }
-            // 快门/EV/WB 没有 getter，用默认值
+            } catch (Throwable t) {
+                paramIso = 0;
+            }
+            // 曝光补偿：v0.5.5 起为本地管线变换（effectiveParams），不走 HAL——
+            // picture-control-exposure-shift 实测被接受但画面零变化（摆设通道）。
+            // 支持位仅探测量化留档；本地计数恒从 0 开始。
+            try {
+                paramSupEv = mod.isPictureControlExposureShiftSupported();
+            } catch (Throwable t) {
+            }
+            paramEv = 0;
+            // 白平衡 LB/CC：当前值 + 运行时范围（替换旧的 ±100 硬编码猜测）
+            try {
+                paramWbLb = mod.getWhiteBalanceShiftLB();
+                paramWbLbMin = mod.getMinWhiteBalanceShiftLB();
+                paramWbLbMax = mod.getMaxWhiteBalanceShiftLB();
+            } catch (Throwable t) {
+            }
+            try {
+                paramWbCc = mod.getWhiteBalanceShiftCC();
+                paramWbCcMin = mod.getMinWhiteBalanceShiftCC();
+                paramWbCcMax = mod.getMaxWhiteBalanceShiftCC();
+            } catch (Throwable t) {
+            }
+            try {
+                paramSupWbMode = mod.isWhiteBalanceShiftModeSupported();
+            } catch (Throwable t) {
+            }
+            // ISO 支持档位表（List<Integer>；用 raw List 规避 stub 泛型属性瑕疵）
+            List lst = null;
+            try {
+                lst = mod.getSupportedISOSensitivities();
+            } catch (Throwable t) {
+            }
+            if (lst != null && !lst.isEmpty()) {
+                int[] arr = new int[lst.size()];
+                int n = 0;
+                for (int i = 0; i < arr.length; i++) {
+                    Object o = lst.get(i);
+                    if (o instanceof Integer) {
+                        arr[n++] = ((Integer) o).intValue();
+                    }
+                }
+                if (n > 0) {
+                    isoStepsSupported = n == arr.length ? arr : Arrays.copyOf(arr, n);
+                    Arrays.sort(isoStepsSupported);
+                    // 当前值若不在表中，吸附到最近档，避免 UI 显示一个相机不认的数
+                    boolean in = false;
+                    for (int v : isoStepsSupported) {
+                        if (v == paramIso) {
+                            in = true;
+                            break;
+                        }
+                    }
+                    if (!in) {
+                        int best = isoStepsSupported[0];
+                        for (int v : isoStepsSupported) {
+                            if (Math.abs(v - paramIso) < Math.abs(best - paramIso)) {
+                                best = v;
+                            }
+                        }
+                        Log.i(TAG, "iso " + paramIso + " not in table, snap to " + best);
+                        paramIso = best;
+                    }
+                }
+            }
+            Log.i(TAG, "param init ev=" + paramEv + "(sup=" + paramSupEv + ") F="
+                    + (paramAperture > 0 ? (paramAperture / 100.0f) : -1)
+                    + " ss=" + paramShutter + " iso=" + paramIso
+                    + "/" + (isoStepsSupported != null ? isoStepsSupported.length : 0)
+                    + " lb=[" + paramWbLbMin + "," + paramWbLbMax + "]@" + paramWbLb
+                    + " cc=[" + paramWbCcMin + "," + paramWbCcMax + "]@" + paramWbCc
+                    + " wbModeSup=" + paramSupWbMode);
+            prepLog("pinit ev=" + paramEv + "/s" + (paramSupEv ? 1 : 0)
+                    + " lb" + paramWbLb + "[" + paramWbLbMin + "," + paramWbLbMax + "]"
+                    + " cc" + paramWbCc + "[" + paramWbCcMin + "," + paramWbCcMax + "]"
+                    + " wbm=" + (paramSupWbMode ? 1 : 0));
         } catch (Throwable t) {
             Log.e(TAG, "initParamValues failed", t);
+            prepLog("initParams fail " + t);
         } finally {
             camLock.unlock();
         }
     }
 
     /** 调整当前参数。delta=±1（步进）。
-     *  注意：RX100M3 的 CameraEx 上光圈/快门用 increment/decrement（步进），
-     *  ParametersModifier 上只有 setISOSensitivity/setWhiteBalanceShift 可用。 */
+     *  v0.5.1 重构（修"只走本地数字不生效"）：
+     *  - 写前：EV 查支持位、WB 夹到运行时 min/max 并先开 shift 总开关、ISO 用
+     *    相机报告档位表；
+     *  - 写后：重新 getParameters 读回 HAL 实际接受的值覆盖 UI——写入被丢弃/
+     *    被夹紧时用户看到的就是真值而不是请求值；req/hal 差异记入 PREPLOG。 */
     private void adjustParam(int delta) {
         if (camera == null || pausing) {
             return;
@@ -1110,55 +1301,70 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             Log.w(TAG, "adjustParam: camLock busy, skip");
             return;
         }
+        int committedWhich = -1; // 走 Parameters 提交通道的项
+        int requested = Integer.MIN_VALUE;
         try {
             Camera cam = camera.getNormalCamera();
             Camera.Parameters p = cam.getParameters();
             CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
             switch (paramIndex) {
-                case PARAM_EV:
-                    paramEv += delta;
-                    // RX100M3 无 setExposureCompensation，用 PictureControlExposureShift
-                    mod.setPictureControlExposureShift(paramEv);
+                case PARAM_EV: {
+                    // 本地曝光变换：重算并写入伽马内容（+EV=数字过曝，-EV=欠曝）。
+                    // 不碰 HAL 参数通道、不需要 setParameters/readBack。
+                    paramEv = clampInt(paramEv + delta, -60, 60);
+                    writePipeline(effectiveParams(
+                            appliedIndex > 0 ? baseParams : null));
                     break;
-                case PARAM_APERTURE:
-                    // CameraEx 直接调 increment/decrement（步进）
+                }
+                case PARAM_APERTURE: {
                     if (delta > 0) {
                         camera.incrementAperture();
                     } else {
                         camera.decrementAperture();
                     }
-                    // 回读当前值（ApertureChangeListener 会更新 paramAperture）
+                    scheduleNativeReadback(true, delta);
                     break;
-                case PARAM_SHUTTER:
+                }
+                case PARAM_SHUTTER: {
                     if (delta > 0) {
                         camera.incrementShutterSpeed();
                     } else {
                         camera.decrementShutterSpeed();
                     }
+                    scheduleNativeReadback(false, delta);
                     break;
-                case PARAM_ISO:
-                    // ISO 步进：100→125→160→200→250→320→400→500→640→800→1000→1250→1600→2000→2500→3200→4000→5000→6400→8000→10000→12800→16000→20000→25600
-                    int[] isoSteps = {100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800, 16000, 20000, 25600};
-                    int idx = 0;
-                    for (int i = 0; i < isoSteps.length; i++) {
-                        if (isoSteps[i] == paramIso) { idx = i; break; }
-                    }
-                    idx = Math.max(0, Math.min(isoSteps.length - 1, idx + delta));
-                    paramIso = isoSteps[idx];
-                    mod.setISOSensitivity(paramIso);
+                }
+                case PARAM_ISO: {
+                    int[] table = isoStepsSupported != null
+                            ? isoStepsSupported : ISO_LEGACY_STEPS;
+                    requested = stepIso(table, paramIso, delta);
+                    paramIso = requested;
+                    mod.setISOSensitivity(requested);
+                    committedWhich = PARAM_ISO;
                     break;
-                case PARAM_WB_LB:
-                    paramWbLb = Math.max(-100, Math.min(100, paramWbLb + delta));
-                    mod.setWhiteBalanceShiftLB(paramWbLb);
+                }
+                case PARAM_WB_LB: {
+                    maybeEnableWbShiftMode(mod); // 官方 LVG 流程：shift 前置总开关
+                    requested = clampInt(paramWbLb + delta,
+                            paramWbLbMin, paramWbLbMax);
+                    paramWbLb = requested;
+                    mod.setWhiteBalanceShiftLB(requested);
+                    committedWhich = PARAM_WB_LB;
                     break;
-                case PARAM_WB_CC:
-                    paramWbCc = Math.max(-100, Math.min(100, paramWbCc + delta));
-                    mod.setWhiteBalanceShiftCC(paramWbCc);
+                }
+                case PARAM_WB_CC: {
+                    maybeEnableWbShiftMode(mod);
+                    requested = clampInt(paramWbCc + delta,
+                            paramWbCcMin, paramWbCcMax);
+                    paramWbCc = requested;
+                    mod.setWhiteBalanceShiftCC(requested);
+                    committedWhich = PARAM_WB_CC;
                     break;
+                }
             }
-            // 光圈/快门走 CameraEx 直接调，不需要 setParameters
-            if (paramIndex != PARAM_APERTURE && paramIndex != PARAM_SHUTTER) {
+            if (committedWhich >= 0) {
                 cam.setParameters(p);
+                readBack(committedWhich, requested);
             }
             refreshTopBar();
             Log.i(TAG, "adjustParam " + paramLabel() + " delta=" + delta);
@@ -1167,6 +1373,107 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             prepLog("adjustParam fail " + t);
         } finally {
             camLock.unlock();
+        }
+    }
+
+    /** 光圈/快门原生步进后的诊断：只记 inhibition 位图（v0.5.5 起真值由
+     *  Aperture/ShutterSpeed 监听器回写字段维护，modifier 读回不可信已弃用）。 */
+    private void scheduleNativeReadback(final boolean aperture, final int delta) {
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                worker.post(new Runnable() {
+                    public void run() {
+                        CameraEx camRef = camera;
+                        if (camRef == null || pausing || !camLock.tryLock()) {
+                            return;
+                        }
+                        try {
+                            int inhib = -1;
+                            try {
+                                inhib = camRef.getInhibitionInfo(); // 控制权 inhibit 位图
+                            } catch (Throwable t) {
+                            }
+                            String tag = aperture ? "IRIS" : "SS";
+                            prepLog("native " + tag + " d=" + delta
+                                    + " inh=0x" + Integer.toHexString(inhib));
+                            mainHandler.post(new Runnable() {
+                                public void run() {
+                                    refreshTopBar();
+                                }
+                            });
+                        } finally {
+                            camLock.unlock();
+                        }
+                    }
+                });
+            }
+        }, 300);
+    }
+
+    private static int clampInt(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /** 白平衡 LB/CC 的前置总开关（官方 Liveview Grading 必开；不开则改值不生效，
+     *  这是此前"白平衡没效果"的头号嫌疑）。 */
+    private void maybeEnableWbShiftMode(CameraEx.ParametersModifier mod) {
+        if (!paramSupWbMode) {
+            return;
+        }
+        try {
+            mod.setWhiteBalanceShiftMode(true);
+        } catch (Throwable t) {
+            prepLog("wb mode on fail " + t);
+        }
+    }
+
+    /** 在升序档位表内向 dir 方向步进；当前值不在表内时吸附到相邻档。 */
+    private static int stepIso(int[] asc, int cur, int dir) {
+        if (asc.length == 0) {
+            return cur;
+        }
+        int i = 0;
+        for (int k = 0; k < asc.length; k++) {
+            if (asc[k] <= cur) {
+                i = k;
+            } else {
+                break;
+            }
+        }
+        i = clampInt(i + dir, 0, asc.length - 1);
+        return asc[i];
+    }
+
+    /** Parameters 类参数的写后读回：HAL 拒收/夹紧时把真实接受值刷回 UI 与日志。
+     *  这一次装机就能定量回答 EV/WB 到底吃不吃、范围几何。 */
+    private void readBack(int which, int requested) {
+        try {
+            Camera.Parameters p2 = camera.getNormalCamera().getParameters();
+            CameraEx.ParametersModifier m2 = camera.createParametersModifier(p2);
+            int hal;
+            String name;
+            switch (which) {
+                case PARAM_ISO:
+                    hal = m2.getISOSensitivity();
+                    name = "ISO";
+                    paramIso = hal;
+                    break;
+                case PARAM_WB_LB:
+                    hal = m2.getWhiteBalanceShiftLB();
+                    name = "WBLB";
+                    paramWbLb = hal;
+                    break;
+                default:
+                    hal = m2.getWhiteBalanceShiftCC();
+                    name = "WBCC";
+                    paramWbCc = hal;
+                    break;
+            }
+            Log.i(TAG, "readback " + name + " req=" + requested + " hal=" + hal);
+            prepLog("rb " + name + " req=" + requested + " hal=" + hal);
+        } catch (Throwable t) {
+            Log.e(TAG, "readback failed", t);
+            prepLog("rb fail " + t);
         }
     }
 
@@ -1197,6 +1504,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     private void requestApply(final int index) {
         final int seq = ++applySeq;
+        final long tReq = System.currentTimeMillis();
+        prepLog("apply req idx=" + index + " seq=" + seq + " " + heapStat());
         if (index == 0) {
             baseParams = null;
             appliedIndex = 0;
@@ -1213,6 +1522,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     params = loadOrDecompose(cubeFiles.get(index - 1));
                 } catch (Throwable t) {
                     Log.e(TAG, "decompose failed", t);
+                    prepLog("apply fail idx=" + index + " " + t);
                     mainHandler.post(new Runnable() {
                         public void run() {
                             topBar.setText("分解失败");
@@ -1227,7 +1537,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                         }
                         baseParams = params;
                         appliedIndex = index;
-                        writePipeline(params.withIntensity(intensity));
+                        writePipeline(effectiveParams(params));
+                        prepLog("apply done idx=" + index
+                                + " total=" + (System.currentTimeMillis() - tReq) + "ms");
                         refreshTopBar();
                         refreshListView();
                     }
@@ -1241,17 +1553,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private LutParams loadOrDecompose(File cubeFile) throws IOException {
         CACHE_DIR.mkdirs();
         File cache = new File(CACHE_DIR, shortName83(cubeFile.getName()) + ".LTC");
-        if (cache.isFile() && cache.lastModified() >= cubeFile.lastModified()) {
-            Log.i(TAG, "cache hit: " + cache.getName());
-            return LutParams.load(cache);
+        if (LutParams.isFresh(cache, cubeFile, null)) {
+            long t0 = System.currentTimeMillis();
+            LutParams p = LutParams.load(cache);
+            prepLog("cachehit " + shortName83(cubeFile.getName())
+                    + " " + (System.currentTimeMillis() - t0) + "ms");
+            return p;
         }
         long t0 = System.currentTimeMillis();
+        prepLog("decompose begin " + cubeFile.getName());
         Cube cube = Cube.load(cubeFile);
         LutParams params = Decomposer.decompose(cube);
         Log.i(TAG, "decomposed " + cubeFile.getName() + " in "
                 + (System.currentTimeMillis() - t0) + "ms");
+        prepLog("decompose done " + shortName83(cubeFile.getName())
+                + " " + (System.currentTimeMillis() - t0) + "ms");
         try {
-            params.save(cache);
+            params.save(cache, cubeFile.length(), cubeFile.lastModified());
         } catch (IOException e) {
             Log.e(TAG, "cache write failed", e);
         }
@@ -1272,7 +1590,130 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         return sb.length() > 0 ? sb.toString() : "LUT";
     }
 
-    /** 写管线（主线程）。params=null 表示关闭。持 camLock 与 shutdown/kick 互斥。 */
+    private static final int[] MATRIX_IDENTITY =
+            {1024, 0, 0, 0, 1024, 0, 0, 0, 1024};
+
+    /** 确保伽马表可用（v0.5.7 三级策略，绕开 create/bind 挂死区）：
+     *  ① static 缓存还活着（暖进程快速重进）→ 直接用；
+     *  ② getExtendedGammaTable() 领养相机上仍绑着的旧表（上个回合退出时
+     *     绑定留在 HAL 里）→ 不创建、不绑定、不碰死区；
+     *  ③ 都没有（真·开机后第一次）→ 才允许一次性的 create+write+bind。 */
+    private boolean ensureBoundGamma() throws IOException {
+        if (sBoundGamma != null) {
+            return true;
+        }
+        try {
+            CameraEx.GammaTable existing = camera.getExtendedGammaTable();
+            if (existing != null) {
+                int bufSize = existing.getSize();
+                if (bufSize > 0 && bufSize <= 8192) {
+                    int points = bufSize / 2;
+                    byte[] buf = new byte[bufSize];
+                    for (int i = 0; i < points; i++) {
+                        int v = (int) ((long) i * 1023
+                                / (points - 1 > 0 ? points - 1 : 1));
+                        buf[2 * i] = (byte) (v & 0xff);
+                        buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+                    }
+                    sBoundGamma = existing;
+                    sIdentityBuf = buf;
+                    Log.i(TAG, "gamma ADOPT pts=" + points);
+                    prepLog("gamma ADOPT pts=" + points);
+                    return true;
+                }
+                prepLog("gamma adopt reject size=" + bufSize);
+            }
+        } catch (Throwable t) {
+            prepLog("gamma adopt fail " + t);
+        }
+        CameraEx.GammaTable table = camera.createGammaTable();
+        table.setPictureEffectGammaForceOff(true);
+        int bufSize = table.getSize();
+        int points = bufSize / 2;
+        if (points <= 0 || points > 4096) {
+            points = 1024;
+        }
+        byte[] buf = new byte[bufSize];
+        for (int i = 0; i < points; i++) {
+            int v = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
+            buf[2 * i] = (byte) (v & 0xff);
+            buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+        }
+        table.write(new ByteArrayInputStream(buf));
+        camera.setExtendedGammaTable(table); // 全开机周期仅此一次的绑定
+        sBoundGamma = table;
+        sIdentityBuf = buf;
+        Log.i(TAG, "gamma FIRSTBIND size=" + bufSize + " pts=" + points);
+        prepLog("gamma FIRSTBIND pts=" + points);
+        return true;
+    }
+
+    /** 向已绑定的表重写 LUT 内容：按表容量重采样 1024 点。 */
+    private void rewriteGamma(int[] gamma) throws IOException {
+        int bufSize = sIdentityBuf != null ? sIdentityBuf.length : 2048;
+        int points = bufSize / 2;
+        byte[] buf = new byte[bufSize];
+        for (int i = 0; i < points; i++) {
+            int src = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
+            int v = gamma[src];
+            buf[2 * i] = (byte) (v & 0xff);
+            buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+        }
+        long t0 = System.currentTimeMillis();
+        sBoundGamma.write(new ByteArrayInputStream(buf));
+        prepLog("gamma rewrite " + (System.currentTimeMillis() - t0) + "ms");
+    }
+
+    /** 组合当前生效参数：基 LUT（或中性）→ 强度混合 → 本地 EV 变换。
+     *  v0.5.5 曝光补偿新通道：picture-control-exposure-shift 在本机被 HAL
+     *  接受但画面零变化（摆设），改为直改伽马内容——out[i]=g[i·2^(EV/3)]，
+     *  正 EV 向高输入端取样＝数字过曝（高光提前截断，与真实加曝同形）。 */
+    private LutParams effectiveParams(LutParams base) {
+        LutParams p = base != null ? base.withIntensity(intensity)
+                : LutParams.identity();
+        if (paramEv != 0) {
+            double k = Math.pow(2.0, paramEv / 3.0);
+            int n = LutParams.KNOTS;
+            int[] g = p.gamma;
+            int[] out = new int[n];
+            for (int i = 0; i < n; i++) {
+                long j = Math.round(i * k);
+                if (j > n - 1) {
+                    j = n - 1;
+                } else if (j < 0) {
+                    j = 0;
+                }
+                out[i] = g[(int) j];
+            }
+            p.gamma = out;
+        }
+        return p;
+    }
+
+    /** 交还相机前的收尾：对单次复用的绑定表补一次 DeviceBuffer.release()。
+     *  v0.5.6 回归修复——"绑定后必须 release"（官方 LVG 用法）释放的是
+     *  Java 侧硬件缓冲区记账，不影响运行中的绑定与内容改写；漏放行则退出
+     *  交还时 HAL 挂着我们的缓冲区，原生界面接管即崩 = 当年退出重启老病根。
+     *  全生命周期只在最终交还这一次（每次切换都建+释的循环正是 HAL 挂死来源，
+     *  两者不冲突：循环禁止，收尾必做）。 */
+    private static void releaseBoundGamma(String via) {
+        if (sBoundGamma != null) {
+            try {
+                Log.i(TAG, "gamma release @" + via);
+                prepLog("gamma release @" + via);
+                sBoundGamma.release();
+            } catch (Throwable t) {
+                Log.e(TAG, "gamma release failed", t);
+            } finally {
+                sBoundGamma = null;
+                sIdentityBuf = null;
+            }
+        }
+    }
+
+    /** 写管线。params=null 表示临时关/关闭：恒等矩阵 + 已绑定表内容归零，
+     *  绝不解绑/重建/释放（v0.5.4 死点规避；旧实现的 setExtendedGammaTable(null)
+     *  属于把 HAL 驱进挂死循环的操作之一，禁用）。 */
     private void writePipeline(LutParams params) {
         if (camera == null) {
             return;
@@ -1288,38 +1729,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 return;
             }
             try {
+                ensureBoundGamma();
                 if (params == null) {
-                    camera.setExtendedGammaTable(null);
-                    writeMatrix(new int[]{1024, 0, 0, 0, 1024, 0, 0, 0, 1024});
-                    Log.i(TAG, "pipeline cleared");
+                    long t0 = System.currentTimeMillis();
+                    sBoundGamma.write(new ByteArrayInputStream(sIdentityBuf));
+                    prepLog("gamma softclear "
+                            + (System.currentTimeMillis() - t0) + "ms");
+                    writeMatrix(MATRIX_IDENTITY);
+                    Log.i(TAG, "pipeline neutralized");
                     return;
                 }
-                CameraEx.GammaTable table = camera.createGammaTable();
-                table.setPictureEffectGammaForceOff(true);
-                // RX100M3 表深探测：伽马表实际字节容量（A6000=2048=1024点×2B，
-                // RX100M3 可能不同——getSize() 只在绑定后的表上有效）。
-                int bufSize = table.getSize();
-                int points = bufSize / 2; // 每点 2 字节
-                if (points <= 0 || points > 4096) {
-                    points = 1024; // 探测异常兜底
-                }
-                Log.i(TAG, "gamma table size=" + bufSize + "B points=" + points);
-                prepLog("gamma table size=" + bufSize + " points=" + points);
-                // 按真实容量写入：1024 点源数据按比例重采样/截断到表深。
-                // 写超出表容量会写脏 HAL 邻接内存——RX100M3 退出重启的病根。
-                byte[] buf = new byte[bufSize];
-                for (int i = 0; i < points; i++) {
-                    int src = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
-                    int v = params.gamma[src];
-                    buf[2 * i] = (byte) (v & 0xff);
-                    buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
-                }
-                table.write(new ByteArrayInputStream(buf));
-                camera.setExtendedGammaTable(table);
-                table.release(); // DeviceBuffer 硬件缓冲区必须显式释放——
-                                  // 官方 Liveview Grading 的用法（Bible.md）。
-                                  // 不 release 会泄漏硬件缓冲区，RX100M3 资源少，
-                                  // 泄漏几次后 HAL 状态脏 → 退出时原生界面接管崩。
+                rewriteGamma(params.gamma);
                 writeMatrix(params.matrix);
                 Log.i(TAG, "pipeline written");
             } catch (Throwable t) {
@@ -1367,7 +1787,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     private void applyIntensity() {
         if (appliedIndex > 0 && baseParams != null) {
-            writePipeline(baseParams.withIntensity(intensity));
+            writePipeline(effectiveParams(baseParams));
         }
         refreshTopBar();
     }
@@ -1395,15 +1815,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
         } catch (Throwable t) {
         }
-        return "LINEAR"; // 缺省：内容恒等（实测 NULL/NONE 都崩）
+        return "LINEAR"; // 解析失败的兜底（缺省路径见本方法开头的 NULL 分支说明）
     }
 
-    /** 退出专用管线清理（v0.3.5，模式化）：按 clrMode 决定清法。
-     *  LINEAR（缺省）：内容写恒等直通（伽马 0..1023 线性 + 矩阵恒等），
-     *      绑定保留，不 setGamma(null)——原生界面接手时看到的是"已绑定但
-     *      内容中性"的状态，它可安全重新配置。
-     *  NULL=先停预览再 setGamma(null) 解绑（实测崩）/
-     *  NONE=完全不清（实测也崩，残留状态毒）/ GAMMA=仅线性伽马 / MATRIX=仅恒等矩阵。 */
+    /** 退出专用管线清理（模式化；v0.5.4 起解绑/新建伽马表被全面禁止——
+     *  反复建绑循环是 HAL 挂死死点，任何模式下都只允许复用已绑定表）。
+     *  当前行为只由 readExitClearMode 的返回值决定：
+     *  无文件=NULL(停预览、保留绑定) / 解析失败=LINEAR(恒等表+恒等矩阵)。
+     *  GAMMA=仅中性化表内容 / MATRIX=仅恒等矩阵 / NONE=完全不动。 */
     private void clearPipelineForExit(String clrMode) {
         if ("NULL".equals(clrMode)) {
             try {
@@ -1412,42 +1831,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             } catch (Throwable t) {
                 Log.e(TAG, "exit stopPreview failed", t);
             }
-            try {
-                camera.setExtendedGammaTable(null); // 解绑（内容无关紧要，状态复位）
-                Log.i(TAG, "exit clear: gamma unbound (null)");
-                prepLog("exit clear unbind");
-            } catch (Throwable t) {
-                Log.e(TAG, "gamma unbind failed", t);
-            }
+            // v0.5.4：不再 setExtendedGammaTable(null) 解绑——解绑/重绑循环
+            // 正是 HAL 挂死的死点路径之一。绑定保留（内容即最后应用的 LUT，
+            // 与缺省 NONE 行为一致），交还原生界面。
+            prepLog("exit clear NULL->keep-bind (unbind banned)");
             return; // 矩阵不动——原生界面会重新配置
         }
         boolean doGamma = "LINEAR".equals(clrMode) || "GAMMA".equals(clrMode);
         boolean doMatrix = "LINEAR".equals(clrMode) || "MATRIX".equals(clrMode);
         if (doGamma) {
-            // 恒等伽马表：按表实际容量写直通值（RX100M3 表深可能与 A6000 不同，
-            // 写超容量会写脏 HAL 内存）
+            // 复用已绑定表写恒等内容（不新建、不解绑、不释放）
             try {
-                CameraEx.GammaTable table = camera.createGammaTable();
-                table.setPictureEffectGammaForceOff(true);
-                int bufSize = table.getSize();
-                int points = bufSize / 2;
-                if (points <= 0 || points > 4096) {
-                    points = 1024;
-                }
-                byte[] buf = new byte[bufSize];
-                for (int i = 0; i < points; i++) {
-                    int v = (int) ((long) i * 1023 / (points - 1 > 0 ? points - 1 : 1));
-                    buf[2 * i] = (byte) (v & 0xff);
-                    buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
-                }
-                table.write(new ByteArrayInputStream(buf));
-                camera.setExtendedGammaTable(table);
-                table.release(); // DeviceBuffer 必须释放，见 writePipeline 注释
-                Log.i(TAG, "exit clear: linear gamma written (" + points + "pts)");
-                prepLog("exit clear linear gamma pts=" + points);
+                ensureBoundGamma();
+                long t0 = System.currentTimeMillis();
+                sBoundGamma.write(new ByteArrayInputStream(sIdentityBuf));
+                prepLog("exit clear gamma neutralized "
+                        + (System.currentTimeMillis() - t0) + "ms");
             } catch (Throwable t) {
-                Log.e(TAG, "linear gamma clear failed", t);
-                prepLog("linear clear fail " + t);
+                Log.e(TAG, "gamma neutralize failed", t);
+                prepLog("exit gamma fail " + t);
             }
         } else {
             prepLog("exit clear skip gamma");
@@ -1964,10 +2366,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             return true;
         }
         if (scan == SCAN_REVIEW) {
-            // 回看键：临时关 LUT（应用 0% 强度），松开恢复
+            // 回看键按住：临时关 LUT 对比原图（记住原索引），松开恢复。
+            // v0.5.1 修复：旧实现只记 requestApply(0)，松开仅在 browsing 态才恢复、
+            // 且恢复错对象(selection)——平时按下后 LUT 永久 OFF。
             if (appliedIndex > 0) {
+                lutIndexBeforeReview = appliedIndex;
                 requestApply(0); // 切到 OFF
-                Log.i(TAG, "review: temp LUT off");
+                Log.i(TAG, "review: temp LUT off (was #" + lutIndexBeforeReview + ")");
             }
             return true;
         }
@@ -2039,13 +2444,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         int scan = event.getScanCode();
         int code = event.getKeyCode();
-        // RX100M3：回看键松开恢复 LUT（如果之前被临时关了）
+        // RX100M3：回看键松开恢复 LUT（v0.5.1：无条件恢复按住前的应用索引）
         if (scan == SCAN_REVIEW) {
-            if (appliedIndex == 0 && browsing) {
-                // 当前是 OFF 但 browsing 状态还在（被临时关的），恢复之前的选择
-                // 简单处理：重新应用当前 selection
-                requestApply(selection);
-                Log.i(TAG, "review: restore LUT");
+            if (lutIndexBeforeReview > 0) {
+                final int restore = lutIndexBeforeReview;
+                lutIndexBeforeReview = -1;
+                selection = restore;
+                requestApply(restore);
+                Log.i(TAG, "review: restore LUT #" + restore);
             }
             return true;
         }
@@ -2069,8 +2475,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     // 控制环（648/649）的 keyUp 也不消费，让原生逻辑处理变焦停止。
 
     /** 浏览中移动选择后 400ms 防抖预览。 */
-    private void debouncePreview() {
-        final int seq = ++applySeq;
+    private void debouncePreview() {        final int seq = ++applySeq;
         mainHandler.postDelayed(new Runnable() {
             public void run() {
                 if (seq == applySeq && browsing) {
@@ -2124,10 +2529,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 mainHandler.post(new Runnable() {
                     public void run() {
                         handBackDisplay(); // 清理完成，正常交还
+                        // v0.5.2 实验：/LUTS/EXITSUICIDE.TXT=ON 时，清理+交还
+                        // 完成后 1.5s 真杀进程。目的：验证"老进程驻留内存是二次
+                        // 进入切换 LUT 变慢"的假说（历史教训是杀进程与 DA 交还
+                        // 竞态会带崩拍摄框架，故默认关闭、且延后到交还之后）。
+                        if (readExitSuicide()) {
+                            mainHandler.postDelayed(new Runnable() {
+                                public void run() {
+                                    Log.w(TAG, "EXITSUICIDE: kill process");
+                                    prepLog("exitsuicide kill " + heapStat());
+                                    android.os.Process.killProcess(
+                                            android.os.Process.myPid());
+                                    System.exit(0);
+                                }
+                            }, 1500);
+                        }
                     }
                 });
             }
         };
         t.start();
+    }
+
+    /** 读 /LUTS/EXITSUICIDE.TXT：内容 ON = 退出完成后真杀进程（实验开关）。 */
+    private static boolean readExitSuicide() {
+        try {
+            File f = new File(LUT_DIR, "EXITSUICIDE.TXT");
+            if (!f.isFile()) {
+                return false;
+            }
+            FileInputStream in = new FileInputStream(f);
+            try {
+                byte[] b = new byte[(int) f.length()];
+                int n = in.read(b);
+                String s = new String(b, 0, n > 0 ? n : 0, "UTF-8")
+                        .trim().toUpperCase();
+                return s.startsWith("ON") || s.startsWith("1");
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return false;
+        }
     }
 }

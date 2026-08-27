@@ -11,5 +11,8 @@ debug.keystore
 # 索尼编译 stub（需自行从相机提取，勿提交，见 docs/BUILD.md）
 stubs/
 
+# stub 分析工作区（反汇编目录、API 目录等临时产物）
+.tmp_stub/
+
 # 系统杂项
 .DS_Store
