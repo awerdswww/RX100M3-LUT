@@ -1,6 +1,8 @@
 package com.sonylut.app;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.hardware.Camera;
 import android.os.Bundle;
 import android.os.Environment;
@@ -40,14 +42,19 @@ import java.util.concurrent.locks.ReentrantLock;
  * 分解为 伽马表+矩阵 写入 ISP 管线，取景/成片实时生效。
  * 拍照后自动标记：JPEG 插入 COM 段，ARW 写 XMP sidecar。
  *
- * 按键（对齐机内习惯）：
- *   拨轮1 / 方向键上下 : 浏览 LUT 列表（实时预览）
- *   拨轮2              : 强度 0-100%
- *   中央键             : 选定 / 收起列表
+ * 按键（v0.7.0 官方风简洁模式，缺省；/LUTS/STYLE.TXT 首词 CLASSIC 回退旧交互）：
+ *   Fn                 : 呼出/收起官方风 LUT 菜单（列表+介绍+强度+退出项）
+ *   上下/拨轮1         : 菜单选择（实时预览）；菜单外按下即呼出菜单
+ *   左右/拨轮2         : 强度 0-100%
+ *   中央键             : 应用并收起菜单（菜单外=呼出菜单）
  *   删除键             : 关闭 LUT
- *   快门半按/全按      : 对焦 / 拍照（原生管线存储）；
- *                      对焦锁定后再次半按先解锁再重新对焦，取景中央显示对焦框
+ *   变焦杆/控制环      : 按官方协议驱动变焦（TELE=0/WIDE=1；按住=单发 max/8
+ *                        +无位移补发，点动=max/4+100ms+stop，见官方应用逆向笔记）
+ *   快门半按/全按      : 对焦 / 拍照（原生管线存储）
+ *   回看键(按住)       : 临时关 LUT 对比原图，松开恢复
  *   MENU               : 退出（参数随 App 退出自动还原）
+ *
+ * CLASSIC 模式保留 v0.6 行为：Fn 进/出参数调节模式，控制环=焦段拨盘。
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback,
         CameraEx.ShutterListener {
@@ -79,14 +86,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     // RX100M3 实测（2026-08-24）：Fn=520，回看=207，C 键无映射（系统未派发）
     private static final int SCAN_FN = 520;        // Fn：进/出参数调节模式
     private static final int SCAN_REVIEW = 207;    // 回看：临时关 LUT 对比原图
-    // RX100M3 的变焦杆(610/611)与控制环(648/649)不在此处理：
-    // 索尼原生 sys.camera 直接响应这些键驱动变焦马达，App 消费与否不影响它。
-    // 我们曾尝试 startZoom/adjustAperture 均被 HAL 拒（powerzoom status=2
-    // UNAVAILABLE，马达控制权在系统侧），故全部让给原生逻辑。
+    // 变焦输入（v0.5.8 起由 App 驱动——实测 App 前台时原生 sys.camera 不再
+    // 处理这些键，旧注释"原生直接接管"对前台场景不成立）。648=CW 出处
+    // Bible.md 输入码表 ISV_RING_CLOCKWISE。
+    private static final int SCAN_ZOOM_W = 610;    // 变焦杆 W（广角）
+    private static final int SCAN_ZOOM_T = 611;    // 变焦杆 T（望远）
+    private static final int SCAN_RING_CW = 648;   // 控制环顺时针
+    private static final int SCAN_RING_CCW = 649;  // 控制环逆时针
 
+    // ---- 变焦驱动（v0.5.10 定案，依据 sess_1e41cb7c 交接笔记）：
+    // startZoom(ZOOM_DIRECTION_*, speed)：0=TELE、1=WIDE（非正负号！），
+    // speed>=1，取 getMaxZoomSpeed() 探测值兜底 2。
+    // 按住推杆仅在下压首帧发一次 startZoom（重复事件忽略——旧实现每帧重发
+    // 导致马达反复启停"一卡一卡"），松开 stopZoom。 ----
+    // v0.7.0 官方定案（三方一致：RX100M3 固件 stub 常量 ZOOM_DIRECTION_TELE=0
+    // /WIDE=1 + 官方 DigitalZoomController.DIRECTION_* + srctrl 遥控映射）。
+    // 旧"实测对调"源于越协议传过 (0,-1)（speed 位为负不在协议内），已推翻。
+    // 若真机 (0,x) 仍表现为广角，再回来改这里并记 PREPLOG。
+    private static final int ZDIR_TELE = 0;
+    private static final int ZDIR_WIDE = 1;
+    private static final int ZOOM_FALLBACK_SPEED = 2;
+    private int zoomSpeed = -1;          // 探测到的最大速度（-1=未探测）
+    private static final long ZOOM_HOLD_REFRESH_MS = 80;   // CLASSIC 模式续发周期
+    private static final long ZOOM_REISSUE_MS = 600;       // 简洁模式：无位移补发窗口
+    private static final long ZOOM_TAP_MS = 100;           // 官方 one-shot 点动时长
+    private static final long ZOOM_RING_THROTTLE_MS = 150; // 简洁模式环节流
+    private int zoomHoldEpoch = 0;       // 按住会话号（松开/换向即失效）
+    private volatile boolean leverDriving = false; // 推杆保持中（环让位）
+    private volatile int lastOptMag = 100;   // 最近一次回调的光学倍率(百分制)
+    private static final int[] PRESET_MM = {24, 28, 35, 50, 70}; // 环拨预设档
+    private static final int GOTO_TOL_MAG = 6;      // 到位容差(≈±1.4mm)
+    private static final long GOTO_STEP_MS = 110;   // 闭环步进节奏
+    private int gotoEpoch = 0;               // 预设步进会话号
+    private static final long RING_THROTTLE_MS = 240;
+    private volatile int zoomDriveDir = 0; // 推杆按住方向：0=空闲 ±1=W/T
+    private long lastRingTickAt = 0;
+    private boolean dzModeEnsured = false; // 数字变焦模式已提交
+    private int dzCurrent = 100;           // 数字变焦当前值（×100）
+    private volatile int pzStatus = -1;      // PowerZoomListener 最近状态（1可用/2不可用/3不适用）
     private SurfaceHolder surfaceHolder;
     private TextView topBar, lutListView, bottomHint;
     private HudView hud;
+
     private volatile CameraEx camera; // shutdown/kick 线程会置换句柄
     private boolean previewStarted = false;
     private boolean surfaceReady = false; // surfaceCreated/Destroyed 维护，
@@ -172,6 +213,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private LutParams baseParams;    // 当前 LUT 的 100% 参数（OFF 时为 null）
     private int applySeq = 0;        // 应用请求序号（防抖）
 
+    // ---- v0.7.0 官方风简洁模式（缺省；/LUTS/STYLE.TXT 首词 CLASSIC 回退）----
+    // 平时零干扰：变焦杆/控制环按官方协议驱动，menuKey 呼出 LutMenu，
+    // 其余按键不消费。参数调节模式与焦段拨盘只在 CLASSIC 模式保留。
+    private boolean simpleMode = true;
+    private int menuKeyScan = SCAN_FN; // 呼出菜单的扫描码（STYLE.TXT menukey= 可改）
+    private boolean menuOpen = false;
+    private int menuSel = 0;         // 菜单选中项：0=OFF，1..n=LUT，n+1=退出
+    private LutMenu lutMenu;
+    private final java.util.Map<String, String> lutDescs =
+            new java.util.HashMap<String, String>(); // 文件名大写词干 → 介绍
+
+    // ---- v0.7.1 回放（回看键）+ LUT 命名 ----
+    private boolean playbackOpen = false;
+    private final List<File> playFiles = new ArrayList<File>();
+    private int playIdx = 0;
+    private Bitmap playBmp;
+    private String playCaption = "";
+    private int playSeq = 0;
+    private PlaybackView playView;
+    private boolean renameEnabled = true; // /LUTS/RENAME.TXT=OFF 关闭 LUT 命名
+    private long shotStartedAt = 0;       // 本次快门时刻（重命名窗口基准）
+
     // 单次绑定复用的伽马表（v0.5.4 起禁循环建绑；v0.5.7 升级为 static——
     // 暖进程二次进入时直接复用上一 Activity 的表对象，连领养都省掉）。
     // RX100M3 驱动实测脾气（两轮日志对账）：
@@ -216,7 +279,63 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         lutListView = (TextView) findViewById(R.id.lutList);
         bottomHint = (TextView) findViewById(R.id.bottomHint);
         hud = (HudView) findViewById(R.id.hud);
-        bottomHint.setText("拨轮1:选择  拨轮2:强度  确认:选定  删除:关闭  MENU:退出");
+        readStyle();
+        loadLutDescs();
+        lutMenu = new LutMenu(this, new LutMenu.DataSource() {
+            public int itemCount() {
+                return cubeFiles.size() + 2; // OFF + LUTs + 退出
+            }
+            public String itemName(int i) {
+                if (i == 0) {
+                    return OFF_NAME;
+                }
+                if (i == cubeFiles.size() + 1) {
+                    return "退出应用";
+                }
+                return prettyName(displayName(i));
+            }
+            public String itemDesc(int i) {
+                if (i == 0) {
+                    return "关闭 LUT，还原图像原生色彩。";
+                }
+                if (i == cubeFiles.size() + 1) {
+                    return "退出应用到原生拍摄界面。退出时自动清理 LUT 管线。";
+                }
+                File f = cubeFiles.get(i - 1);
+                String d = lutDescs.get(stemOf(f.getName()));
+                return d != null ? d : "V-Log 转换胶片模拟 LUT。";
+            }
+            public boolean isApplied(int i) {
+                return i == appliedIndex;
+            }
+            public int selection() {
+                return menuSel;
+            }
+            public int intensity() {
+                return intensity;
+            }
+        });
+        lutMenu.setVisibility(View.GONE);
+        ((android.view.ViewGroup) findViewById(android.R.id.content)).addView(
+                lutMenu, new android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+        playView = new PlaybackView(this, new PlaybackView.Provider() {
+            public Bitmap bitmap() {
+                return playBmp;
+            }
+            public String caption() {
+                return playCaption;
+            }
+        });
+        playView.setVisibility(View.GONE);
+        ((android.view.ViewGroup) findViewById(android.R.id.content)).addView(
+                playView, new android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+        bottomHint.setText(simpleMode
+                ? "Fn:菜单  拨杆/控制环:变焦  回看:回放  删除:关LUT  MENU:退出"
+                : "拨轮1:选择  拨轮2:强度  确认:选定  删除:关闭  MENU:退出");
 
         HandlerThread t = new HandlerThread("lut-worker");
         t.start();
@@ -335,6 +454,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             } catch (Throwable t) {
                 Log.i(TAG, "setApertureChangeListener n/a: " + t);
             }
+            // v0.5.8：PowerZoom 状态监听（变焦马达可用性信息源；旧"被 HAL 拒"
+            // 结论来自未注册监听时的盲试，本次重审）
+            try {
+                camera.setPowerZoomListener(new CameraEx.PowerZoomListener() {
+                    public void onChanged(int status, CameraEx c) {
+                        if (status != pzStatus) {
+                            Log.i(TAG, "powerzoom status=" + status
+                                    + " (1=avail,2=unavail,3=inapplicable)");
+                        }
+                        pzStatus = status;
+                    }
+                });
+            } catch (Throwable t) {
+                Log.i(TAG, "setPowerZoomListener n/a: " + t);
+            }
             // RX100M3：索尼"图像存储完成"权威信号（诊断 + 供护栏参考）。
             // 文件写稳 ≠ 索尼收尾完（缩略图/数据库/RAW 处理更久）。
             try {
@@ -352,10 +486,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             try {
                 camera.setZoomChangeListener(new CameraEx.ZoomChangeListener() {
                     public void onChanged(CameraEx.ZoomInfo info, CameraEx c) {
-                        final String s = "变焦 " + info.opticalPosition
-                                + "/" + info.opticalMagnification
-                                + (info.stopped ? " 停" : "");
-                        Log.i(TAG, "zoom changed: " + s);
+                        lastOptMag = info.opticalMagnification;
+                        int fl = Math.round(24f * info.opticalMagnification / 100f);
+                        if (fl < 24) fl = 24;
+                        if (fl > 70) fl = 70;
+                        final String s = "焦距 " + fl + "mm"
+                                + (info.stopped ? "" : "...");
                         mainHandler.post(new Runnable() {
                             public void run() {
                                 topBar.setText(s);
@@ -582,6 +718,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             camLock.unlock();
         }
         previewStarted = false;
+        zoomDriveDir = 0;
+        stopHoldLoop();      // 终止按住续发循环
         cleanupDone = true; // 看门狗凭此判断：清理已完成就绝不杀进程
         Log.i(TAG, "shutdown done +" + rel(t0) + "ms");
         prepLog("shutdown done " + rel(t0) + "ms");
@@ -1911,6 +2049,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             takingPicture = true;
             captureDraining = true;
             storeCompleteAt = 0; // 新一次拍照，重置存储完成信号
+            shotStartedAt = System.currentTimeMillis();
             Log.i(TAG, "capture drain begin (shutter)");
             prepLog("capture drain begin");
             camera.burstableTakePicture();
@@ -1973,54 +2112,160 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }, 1500);
     }
 
-    /** 写盘护栏 + 可选打标。闩锁（captureDraining）由 onShutter 的 1600ms
-     *  尾任务在本任务之后串行复位，即护栏走完才放行退出清理。 */
+    /** 写盘护栏（v0.7.1 短版）+ LUT 命名。
+     *  权威信号=索尼 StoreImageComplete 回调（图像落盘+机内收尾完成点），
+     *  回调后 800ms 即放行；5s 没等到回调才降级为文件稳定短检查+1.5s 余量。
+     *  旧版"12s 文件稳定+5s 余量"是打标时代（原地重写 JPEG）的防竞态设计，
+     *  打标已禁用、gamma release 已修的前提下过保守，专门拖慢"拍完立刻退出"。
+     *  闩锁（captureDraining）仍由 onShutter 的 1600ms 尾任务在本任务之后
+     *  串行复位——护栏走完才放行退出清理的顺序保持不变。 */
     private void barrierAndTag(String label) {
         try {
+            long t0 = System.currentTimeMillis();
+            while (storeCompleteAt == 0
+                    && System.currentTimeMillis() - t0 < 5000) {
+                Thread.sleep(150);
+            }
             File newest = findNewestPhoto(DCIM_DIR);
-            if (newest == null) {
+            if (newest == null
+                    || System.currentTimeMillis() - newest.lastModified() > 60000) {
+                prepLog("barrier: no fresh photo, skip");
                 return;
             }
-            // 只关注 30 秒内的新文件；太旧说明索尼早就写完了
-            if (System.currentTimeMillis() - newest.lastModified() > 30000) {
-                Log.i(TAG, "newest photo old, barrier skip");
-                return;
-            }
-            boolean stable = waitFileStable(newest);
-            // 文件写稳后索尼还有内部收尾（缩略图/媒体库/RAW 处理），
-            // 实测仅等文件稳定仍会在退出时打断它 → 重启。追加固定余量，
-            // 若索尼的 store-complete 回调已到则可提前结束。
-            long graceEnd = System.currentTimeMillis() + 5000;
-            while (System.currentTimeMillis() < graceEnd) {
-                if (storeCompleteAt > 0
-                        && System.currentTimeMillis() - storeCompleteAt > 1500) {
-                    break; // 回调到达且过了 1.5s，索尼收尾完
-                }
-                try {
-                    Thread.sleep(300);
-                } catch (InterruptedException e) {
-                    break;
-                }
+            boolean stable = waitFileStableShort(newest);
+            long settleEnd = System.currentTimeMillis()
+                    + (storeCompleteAt > 0 ? 800 : 1500);
+            while (System.currentTimeMillis() < settleEnd) {
+                Thread.sleep(100);
             }
             Log.i(TAG, "write barrier done: " + newest.getName()
-                    + " stable=" + stable
-                    + " storeCb=" + (storeCompleteAt > 0 ? "yes" : "no"));
-            prepLog("write barrier " + (stable ? "ok" : "timeout")
-                    + " storeCb=" + (storeCompleteAt > 0 ? "y" : "n"));
-            if (label == null || !stable || taggedFiles.contains(newest.getPath())) {
-                return; // 护栏模式下或未稳定：到此为止，不动文件
+                    + " stable=" + stable + " storeCb="
+                    + (storeCompleteAt > 0 ? "yes" : "no")
+                    + " +" + rel(t0) + "ms");
+            prepLog("write barrier " + (stable ? "ok" : "short")
+                    + " storeCb=" + (storeCompleteAt > 0 ? "y" : "n")
+                    + " " + rel(t0) + "ms");
+            // LUT 命名（v0.7.1）：应用了 LUT 且 RENAME.TXT 未关时，
+            // 把本次快门写出的照片改名 DSC####_LUT名.ext
+            if (renameEnabled && appliedIndex > 0 && stable) {
+                String tag = shortLutTag();
+                if (tag.length() > 0) {
+                    renameRecentPhotos(shotStartedAt, tag);
+                }
             }
-            String n = newest.getName().toUpperCase();
-            if (n.endsWith(".JPG")) {
-                insertJpegComment(newest, "CUSTOM LUT: " + label);
-            } else {
-                writeXmpSidecar(newest, "CUSTOM LUT: " + label);
-            }
-            taggedFiles.add(newest.getPath());
-            Log.i(TAG, "tagged " + newest.getName() + " : " + label);
+        } catch (InterruptedException e) {
+            // shutdown 抢占：直接放行
         } catch (Throwable t) {
-            Log.e(TAG, "tagNewestPhoto failed", t);
+            Log.e(TAG, "barrier failed", t);
         }
+    }
+
+    /** 文件稳定短检查：连续两次（间隔 400ms）长度一致且 >0 即过，上限 4s。 */
+    private static boolean waitFileStableShort(File f) throws InterruptedException {
+        long last = -1;
+        for (int i = 0; i < 10; i++) {
+            long len = f.length();
+            if (len > 0 && len == last) {
+                return true;
+            }
+            last = len;
+            Thread.sleep(400);
+        }
+        return f.length() > 0;
+    }
+
+    /** 当前 LUT 名转文件名后缀（仅 ASCII 字母数字，大写，≤8 字符）。 */
+    private String shortLutTag() {
+        String s = prettyName(displayName(appliedIndex));
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length() && sb.length() < 8; i++) {
+            char c = s.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                    || (c >= '0' && c <= '9')) {
+                sb.append(Character.toUpperCase(c));
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 把 since 时刻之后写出的 JPG/ARW 原地改名 base_LUT名.ext。
+     *  只改文件名不碰内容（与打标时代的原地重写是两码事）；改过的文件
+     *  记入 taggedFiles 防重复。机内媒体库可能要重建后才认识新名字——
+     *  /LUTS/RENAME.TXT=OFF 可整体关闭。 */
+    private void renameRecentPhotos(long since, String tag) {
+        File[] subs = DCIM_DIR.listFiles();
+        if (subs == null) {
+            return;
+        }
+        int renamed = 0;
+        for (File sub : subs) {
+            if (!sub.isDirectory()) {
+                continue;
+            }
+            File[] files = sub.listFiles();
+            if (files == null) {
+                continue;
+            }
+            for (File f : files) {
+                if (!f.isFile() || f.lastModified() < since - 2000) {
+                    continue;
+                }
+                String path = f.getPath();
+                if (taggedFiles.contains(path)) {
+                    continue;
+                }
+                String n = f.getName();
+                String up = n.toUpperCase();
+                if (!up.endsWith(".JPG") && !up.endsWith(".ARW")) {
+                    continue;
+                }
+                if (up.contains("_" + tag + ".")) {
+                    continue; // 已带后缀
+                }
+                try {
+                    if (!waitFileStableShort(f)) {
+                        prepLog("rename skip (unstable) " + n);
+                        continue;
+                    }
+                } catch (InterruptedException e) {
+                    return;
+                }
+                int dot = n.lastIndexOf('.');
+                String newName = n.substring(0, dot) + "_" + tag
+                        + n.substring(dot);
+                File target = new File(sub, newName);
+                if (target.exists()) {
+                    prepLog("rename skip (exists) " + newName);
+                    continue;
+                }
+                if (f.renameTo(target)) {
+                    taggedFiles.add(path);
+                    taggedFiles.add(target.getPath());
+                    renamed++;
+                    Log.i(TAG, "renamed " + n + " -> " + newName);
+                    prepLog("renamed " + n + " -> " + newName);
+                } else {
+                    prepLog("rename fail " + n);
+                }
+            }
+        }
+        if (renamed > 0) {
+            topBarTextTemp("已命名 LUT:" + tag, 1500);
+        }
+    }
+
+    /** 顶栏临时消息（worker 线程安全，到时刷新回常驻状态）。 */
+    private void topBarTextTemp(final String msg, long ms) {
+        mainHandler.post(new Runnable() {
+            public void run() {
+                topBar.setText(msg);
+            }
+        });
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                refreshTopBar();
+            }
+        }, ms);
     }
 
     /** 在 DCIM 各子目录里找最新的 JPG/ARW。 */
@@ -2279,6 +2524,67 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         if (startupComputing) {
             return true; // 预计算期间吞掉其余按键
         }
+        // 简洁模式回放（回看键呼出）：左右/拨轮1浏览，回看/中央返回。
+        // 半按/全按快门=关掉回放直接拍摄。
+        if (simpleMode && playbackOpen) {
+            if (scan == SCAN_REVIEW) {
+                closePlayback();
+                return true;
+            }
+            if (scan == SCAN_LEFT || scan == SCAN_DIAL1_CCW) {
+                playStep(-1);
+                return true;
+            }
+            if (scan == SCAN_RIGHT || scan == SCAN_DIAL1_CW) {
+                playStep(1);
+                return true;
+            }
+            if (code == KeyEvent.KEYCODE_DPAD_CENTER
+                    || code == KeyEvent.KEYCODE_ENTER) {
+                closePlayback();
+                return true;
+            }
+            if (scan == SCAN_S1 || scan == SCAN_S2) {
+                closePlayback(); // 落到后面分支直接对焦/拍摄
+            } else {
+                return true; // 其余键回放中吞掉防误触
+            }
+        }
+        // 简洁模式菜单按键（打开时优先消化导航/确认/强度；快门与变焦不拦，
+        // 落到后面分支照常工作——官方应用同样允许菜单开着拍摄）
+        if (simpleMode && menuOpen) {
+            if (scan == SCAN_UP || scan == SCAN_DIAL1_CCW) {
+                menuMove(-1);
+                return true;
+            }
+            if (scan == SCAN_DOWN || scan == SCAN_DIAL1_CW) {
+                menuMove(1);
+                return true;
+            }
+            if (scan == SCAN_LEFT || scan == SCAN_DIAL2_CCW) {
+                intensity = Math.max(0, intensity - 5);
+                applyIntensity();
+                lutMenu.invalidate();
+                return true;
+            }
+            if (scan == SCAN_RIGHT || scan == SCAN_DIAL2_CW) {
+                intensity = Math.min(100, intensity + 5);
+                applyIntensity();
+                lutMenu.invalidate();
+                return true;
+            }
+            if (code == KeyEvent.KEYCODE_DPAD_CENTER
+                    || code == KeyEvent.KEYCODE_ENTER) {
+                toggleMenu(); // 实时预览已生效，中央键=确认收起
+                return true;
+            }
+            if (scan == SCAN_DELETE || code == KeyEvent.KEYCODE_DEL) {
+                menuSel = 0;
+                requestApply(0);
+                toggleMenu();
+                return true;
+            }
+        }
         if (scan == SCAN_DELETE || code == KeyEvent.KEYCODE_DEL) {
             selection = 0;
             browsing = false;
@@ -2360,23 +2666,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             return true;
         }
-        // RX100M3：Fn 键（520）进/出参数调节模式，回看键（207）临时关 LUT 对比
-        if (scan == SCAN_FN) {
+        // Fn 键：简洁模式=呼出/收起官方风菜单；CLASSIC=进/出参数调节模式。
+        // 回看键（207）临时关 LUT 对比，两种模式共用（见下方 REVIEW 分支）
+        if (simpleMode && scan == menuKeyScan) {
+            toggleMenu();
+            return true;
+        }
+        if (!simpleMode && scan == SCAN_FN) {
             toggleParamMode();
             return true;
         }
         if (scan == SCAN_REVIEW) {
-            // 回看键按住：临时关 LUT 对比原图（记住原索引），松开恢复。
-            // v0.5.1 修复：旧实现只记 requestApply(0)，松开仅在 browsing 态才恢复、
-            // 且恢复错对象(selection)——平时按下后 LUT 永久 OFF。
-            if (appliedIndex > 0) {
-                lutIndexBeforeReview = appliedIndex;
-                requestApply(0); // 切到 OFF
-                Log.i(TAG, "review: temp LUT off (was #" + lutIndexBeforeReview + ")");
+            if (simpleMode) {
+                // v0.7.1：回看键=照片回放（旧的"按住临时关 LUT"退役）
+                togglePlayback();
+            } else {
+                // CLASSIC：按住临时关 LUT 对比原图（记住原索引），松开恢复。
+                if (appliedIndex > 0) {
+                    lutIndexBeforeReview = appliedIndex;
+                    requestApply(0); // 切到 OFF
+                    Log.i(TAG, "review: temp LUT off (was #" + lutIndexBeforeReview + ")");
+                }
             }
             return true;
         }
+        // v0.5.8：变焦杆/控制环（App 前台时马达归本 App 驱动）
+        if (scan == SCAN_ZOOM_W || scan == SCAN_ZOOM_T
+                || scan == SCAN_RING_CW || scan == SCAN_RING_CCW) {
+            handleZoomKey(scan, event.getRepeatCount());
+            return true;
+        }
         if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
+            if (simpleMode) {
+                if (!menuOpen) {
+                    openMenu(); // 菜单开时的中央键已在上方分支消化
+                }
+                return true;
+            }
             if (paramMode) {
                 paramMode = false; // 中央键退出参数模式
                 refreshTopBar();
@@ -2418,6 +2744,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         boolean prev = (scan == SCAN_DIAL1_CCW || scan == SCAN_UP);
         boolean next = (scan == SCAN_DIAL1_CW || scan == SCAN_DOWN);
         if (prev || next) {
+            if (simpleMode) {
+                // 简洁模式：菜单外拨轮/上下=呼出菜单并开始移动选择
+                if (!menuOpen) {
+                    openMenu();
+                }
+                menuMove(next ? 1 : -1);
+                return true;
+            }
             if (!browsing) {
                 browsing = true;
                 selection = appliedIndex;
@@ -2444,9 +2778,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         int scan = event.getScanCode();
         int code = event.getKeyCode();
-        // RX100M3：回看键松开恢复 LUT（v0.5.1：无条件恢复按住前的应用索引）
+        // RX100M3：回看键松开恢复 LUT（仅 CLASSIC 模式的临时关对比功能）
         if (scan == SCAN_REVIEW) {
-            if (lutIndexBeforeReview > 0) {
+            if (!simpleMode && lutIndexBeforeReview > 0) {
                 final int restore = lutIndexBeforeReview;
                 lutIndexBeforeReview = -1;
                 selection = restore;
@@ -2455,12 +2789,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             return true;
         }
+        // v0.5.8：变焦杆松开必须先于通用吞掉逻辑处理（松开=停马达/停步进）
+        if (scan == SCAN_ZOOM_W || scan == SCAN_ZOOM_T) {
+            handleZoomUp(scan);
+            return true;
+        }
         if (scan == SCAN_MENU || scan == SCAN_DELETE || scan == SCAN_S1 || scan == SCAN_S2
                 || scan == SCAN_S1_UP
                 || scan == SCAN_DIAL1_CW || scan == SCAN_DIAL1_CCW
                 || scan == SCAN_DIAL2_CW || scan == SCAN_DIAL2_CCW
                 || scan == SCAN_UP || scan == SCAN_DOWN
-                || scan == SCAN_FN || scan == SCAN_REVIEW
+                || scan == SCAN_FN || scan == menuKeyScan || scan == SCAN_REVIEW
                 || code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_DEL
                 || code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
                 || code == 0) {
@@ -2469,10 +2808,430 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         return super.onKeyUp(keyCode, event);
     }
 
-    // RX100M3 变焦杆(610/611)与控制环(648/649)的处理已全部移除：
-    // 索尼原生 sys.camera 直接消费这些键驱动变焦，App 侧 startZoom/adjustAperture
-    // 均被 HAL 拒绝（powerzoom status=2 UNAVAILABLE），原生接管反而是唯一能用的路径。
-    // 控制环（648/649）的 keyUp 也不消费，让原生逻辑处理变焦停止。
+    // ---------------- 变焦（v0.5.8：自校准光学驱动 + 数字变焦兜底） ----------------
+    // 历史结论勘误：旧注释"startZoom 被 HAL 拒/powerzoom status=2"来自一次
+    // 未注册监听的盲试且参数语义不明，不具因果效力。本版第一次使用某方向时
+    // 自动做参数校准（候选表逐组试、以 opticalPosition 位移判有效），锁定后
+    // 手感与原生一致（按住连续变焦）；全败的方向降级数字变焦步进。
+    // 约定假设：opticalPosition 增大=望远（HUD 变焦倍率可目测印证）。
+
+    private boolean isZoomLeverScan(int scan) {
+        return scan == SCAN_ZOOM_T || scan == SCAN_ZOOM_W;
+    }
+
+    private int zoomDirOf(int scan) {
+        if (scan == SCAN_ZOOM_T || scan == SCAN_RING_CW) {
+            return 1;
+        }
+        if (scan == SCAN_ZOOM_W || scan == SCAN_RING_CCW) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /** 键按下入口。简洁模式=官方协议（推杆单发 max/8+无位移补发，
+     *  控制环点动 max/4+100ms+stop）；CLASSIC=旧 80ms 续发/焦段拨盘。 */
+    private void handleZoomKey(int scan, int repeatCount) {
+        int dir = zoomDirOf(scan);
+        if (dir == 0) {
+            return;
+        }
+        if (isZoomLeverScan(scan)) {
+            if (repeatCount > 0 && zoomDriveDir == dir) {
+                return; // 按住期间：马达已在转，别再打断
+            }
+            zoomDriveDir = dir;
+            leverDriving = true;
+            if (simpleMode) {
+                leverWatchdog(dir);
+            } else {
+                safeStopZoom("flush"); // 冲掉上一脉冲残留，首帧即可动
+                zoomDrive(dir);
+                holdLoop(dir);
+                // 松开由 keyUp 终止；按住用续发循环维持
+            }
+        } else if (simpleMode) {
+            ringPulse(dir);
+        } else {
+            ringTick(dir);
+        }
+    }
+
+    private void handleZoomUp(int scan) {
+        int dir = zoomDirOf(scan);
+        if (dir != 0 && zoomDriveDir == dir) {
+            zoomDriveDir = 0;
+            stopHoldLoop();
+            leverDriving = false;
+            safeStopZoom("lever-up");
+        }
+    }
+
+    /** 按住期间的续发循环：HAL 是短脉冲驱动，需周期性补发维持转动。 */
+    private void holdLoop(final int dir) {
+        final int ep = ++zoomHoldEpoch;
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (ep != zoomHoldEpoch || zoomDriveDir != dir) {
+                    return;
+                }
+                zoomDrive(dir);
+                holdLoopKeep(dir, ep);
+            }
+        }, ZOOM_HOLD_REFRESH_MS);
+    }
+
+    private void holdLoopKeep(final int dir, final int ep) {
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (ep != zoomHoldEpoch || zoomDriveDir != dir || pausing) {
+                    return;
+                }
+                zoomDrive(dir);
+                holdLoopKeep(dir, ep);
+            }
+        }, ZOOM_HOLD_REFRESH_MS);
+    }
+
+    private void stopHoldLoop() {
+        zoomHoldEpoch++;
+    }
+
+    // ---- v0.7.0 官方协议变焦（依据 docs/official-apps-reverse.md 定案）----
+    // srctrl 官方配方：按住=单发 startZoom(dir, max/8) + 松开 stopZoom；
+    // 点动=单发 startZoom(dir, max/4) + 100ms + stopZoom。
+    // 本机历史实测驱动会自行衰减，故加"无位移补发"看门狗：仅当指令发出后
+    // 光学倍率回调零位移时才补发——官方语义的连续驱动不被打断。
+
+    private int holdSpeed() {
+        int s = probeZoomSpeed();
+        return Math.max(1, s / 8); // 官方持续档：maxSpeed/8
+    }
+
+    private int tapSpeed() {
+        int s = probeZoomSpeed();
+        return Math.max(1, s / 4); // 官方点动档：maxSpeed/4
+    }
+
+    /** 按住看门狗：下发指令→600ms 后检查位移，零位移才补发，循环至松开。 */
+    private void leverWatchdog(final int dir) {
+        final int ep = ++zoomHoldEpoch;
+        stepLever(dir, ep);
+    }
+
+    private void stepLever(final int dir, final int ep) {
+        final int baseMag = lastOptMag;
+        zoomDriveSp(dir, holdSpeed());
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (ep != zoomHoldEpoch || zoomDriveDir != dir || pausing) {
+                    return;
+                }
+                if (lastOptMag != baseMag) {
+                    // 有位移：驱动仍在持续，只重新锚定基线继续观察
+                    mainHandler.postDelayed(new Runnable() {
+                        public void run() {
+                            if (ep != zoomHoldEpoch || zoomDriveDir != dir
+                                    || pausing) {
+                                return;
+                            }
+                            stepLever(dir, ep);
+                        }
+                    }, ZOOM_REISSUE_MS);
+                } else {
+                    stepLever(dir, ep); // 零位移：HAL 自行衰减了，补发维持
+                }
+            }
+        }, ZOOM_REISSUE_MS);
+    }
+
+    /** 控制环点动脉冲：官方 one-shot 配方（max/4 + 100ms + stopZoom）。 */
+    private void ringPulse(final int dir) {
+        long now = System.currentTimeMillis();
+        if (now - lastRingTickAt < ZOOM_RING_THROTTLE_MS || leverDriving) {
+            return;
+        }
+        lastRingTickAt = now;
+        zoomDriveSp(dir, tapSpeed());
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (!leverDriving) {
+                    safeStopZoom("ring-pulse");
+                }
+            }
+        }, ZOOM_TAP_MS);
+    }
+
+    /** 官方协议下发：方向 + 指定速度档（与 CLASSIC 的 zoomDrive(dir) 全速
+     *  版本并存；ZDIR_TELE=0/WIDE=1 见常量声明处）。 */
+    private void zoomDriveSp(int dir, int spd) {
+        if (camera == null || pausing) {
+            return;
+        }
+        int protoDir = dir > 0 ? ZDIR_TELE : ZDIR_WIDE;
+        try {
+            if (camLock.tryLock()) {
+                try {
+                    if (camera != null && !pausing) {
+                        camera.startZoom(protoDir, spd);
+                        Log.i(TAG, "zoomSp dir=" + dir + " proto=" + protoDir
+                                + " spd=" + spd);
+                    }
+                } finally {
+                    camLock.unlock();
+                }
+            }
+        } catch (Throwable t) {
+            prepLog("zoomSp ex dir=" + dir + " " + t.getMessage());
+        }
+    }
+
+
+    /** 控制环=预设焦段拨盘：每格在 24/28/35/50/70 间步进，
+     *  由倍率回做闭环把镜头脉冲驱动到目标档位后自动停。 */
+    private void ringTick(int dir) {
+        long now = System.currentTimeMillis();
+        if (now - lastRingTickAt < RING_THROTTLE_MS || leverDriving) {
+            return;
+        }
+        lastRingTickAt = now;
+        int curIdx = nearestPresetIdx(lastOptMag);
+        int tgtIdx = curIdx + dir;
+        if (tgtIdx < 0 || tgtIdx >= PRESET_MM.length) {
+            topBar.setTextColor(0xFFFF6666);
+            topBar.setText(dir > 0 ? "已是长焦端" : "已是广角端");
+            mainHandler.postDelayed(new Runnable() {
+                public void run() {
+                    topBar.setTextColor(0xFFFFFFFF);
+                    refreshTopBar();
+                }
+            }, 700);
+            return;
+        }
+        gotoPreset(tgtIdx);
+    }
+
+    private static int nearestPresetIdx(int mag) {
+        int best = 0;
+        int bd = Integer.MAX_VALUE;
+        for (int i = 0; i < PRESET_MM.length; i++) {
+            int d = Math.abs(presetMag(i) - mag);
+            if (d < bd) {
+                bd = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static int presetMag(int idx) {
+        return PRESET_MM[idx] * 100 / 24; // mm → 光学倍率百分制
+    }
+
+    /** 闭环驱动到指定焦段档位（epoch 防串场；推杆优先）。 */
+    private void gotoPreset(final int idx) {
+        stopHoldLoop();
+        final int ep = ++gotoEpoch;
+        final int tgtMag = presetMag(idx);
+        final String name = PRESET_MM[idx] + "mm";
+        topBar.setText("焦距→" + name);
+        prepLog("preset goto " + name + " tgtMag=" + tgtMag);
+        mainHandler.post(new Runnable() {
+            public void run() {
+                gotoStep(ep, tgtMag, name);
+            }
+        });
+    }
+
+    private void gotoStep(final int ep, final int tgtMag, final String name) {
+        CameraEx camRef = camera;
+        if (ep != gotoEpoch || camRef == null || pausing || leverDriving) {
+            return;
+        }
+        int cur = lastOptMag;
+        int diff = tgtMag - cur;
+        if (Math.abs(diff) <= GOTO_TOL_MAG) {
+            safeStopZoom("preset-arrive");
+            Log.i(TAG, "preset arrived " + name + " mag=" + cur);
+            prepLog("preset arrive " + name + " mag=" + cur);
+            mainHandler.post(new Runnable() {
+                public void run() {
+                    topBar.setText("焦距 " + name);
+                }
+            });
+            return;
+        }
+        final int protoDir = diff > 0 ? ZDIR_TELE : ZDIR_WIDE;
+        try {
+            if (camLock.tryLock()) {
+                try {
+                    camera.startZoom(protoDir, Math.max(2, zoomSpeed / 2));
+                } finally {
+                    camLock.unlock();
+                }
+            }
+        } catch (Throwable t) {
+            prepLog("goto ex " + t.getMessage());
+        }
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (ep != gotoEpoch) {
+                    return;
+                }
+                safeStopZoom("preset-pulse");
+                mainHandler.postDelayed(new Runnable() {
+                    public void run() {
+                        gotoStep(ep, tgtMag, name);
+                    }
+                }, 60);
+            }
+        }, GOTO_STEP_MS);
+    }
+
+    /** 物理方向(+1=T/-1=W)映射为协议方向参数并下发。
+     *  按 dx dump 常量与上一会话交接笔记：TELE=0、WIDE=1，速度探测上限。 */
+    private void zoomDrive(int dir) {
+        if (camera == null || pausing) {
+            return;
+        }
+        int protoDir = dir > 0 ? ZDIR_TELE : ZDIR_WIDE;
+        int spd = probeZoomSpeed();
+        try {
+            if (camLock.tryLock()) {
+                try {
+                    if (camera != null && !pausing) {
+                        camera.startZoom(protoDir, spd);
+                        Log.i(TAG, "zoom drive dir=" + dir + " proto=" + protoDir
+                                + " speed=" + spd);
+                    }
+                } finally {
+                    camLock.unlock();
+                }
+            }
+        } catch (Throwable t) {
+            prepLog("startZoom ex dir=" + dir + " " + t.getMessage());
+        }
+    }
+
+    /** getMaxZoomSpeed() 探测一次并缓存；失败回落 2。 */
+    private int probeZoomSpeed() {
+        if (zoomSpeed > 0) {
+            return zoomSpeed;
+        }
+        try {
+            if (camLock.tryLock()) {
+                try {
+                    if (camera != null) {
+                        Camera.Parameters p =
+                                camera.getNormalCamera().getParameters();
+                        CameraEx.ParametersModifier mod =
+                                camera.createParametersModifier(p);
+                        int mx = mod.getMaxZoomSpeed();
+                        zoomSpeed = clampInt(mx, 1, 10);
+                        prepLog("zoom maxSpeed=" + zoomSpeed);
+                    }
+                } finally {
+                    camLock.unlock();
+                }
+            }
+        } catch (Throwable t) {
+            prepLog("zoomSpeed probe fail " + t);
+        }
+        if (zoomSpeed <= 0) {
+            zoomSpeed = ZOOM_FALLBACK_SPEED;
+        }
+        return zoomSpeed;
+    }
+
+    private void safeStopZoom(String via) {
+        if (camera == null || !camLock.tryLock()) {
+            return;
+        }
+        try {
+            if (camera != null) {
+                camera.stopZoom();
+            }
+        } catch (Throwable t) {
+            // 静默
+        } finally {
+            camLock.unlock();
+        }
+    }
+
+    /** 数字变焦兜底步进。 */
+    private int dzMax100 = 400;
+
+    private void digitalStep(int dir) {
+        if (camera == null || !camLock.tryLock()) {
+            return;
+        }
+        try {
+            if (camera == null || pausing) {
+                return;
+            }
+            if (!dzModeEnsured) {
+                dzModeEnsured = ensureDigitalZoomMode();
+            }
+            if (!dzModeEnsured) {
+                prepLog("dz skip (mode n/a)");
+                return;
+            }
+            int next = clampInt(dzCurrent + dir * 50, 100, dzMax100);
+            if (next == dzCurrent) {
+                return;
+            }
+            camera.setDigitalZoom(next);
+            dzCurrent = next;
+            prepLog("dz step dir=" + dir + " -> " + next);
+        } catch (Throwable t) {
+            prepLog("dz fail " + t);
+        } finally {
+            camLock.unlock();
+        }
+    }
+
+    private boolean ensureDigitalZoomMode() {
+        try {
+            Camera cam = camera.getNormalCamera();
+            Camera.Parameters p = cam.getParameters();
+            CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
+            java.util.List types = mod.getSupportedDigitalZoomTypes();
+            boolean smart = false;
+            int maxMag = -1;
+            if (types != null) {
+                for (int i = 0; i < types.size(); i++) {
+                    Object o = types.get(i);
+                    if (o instanceof String
+                            && ((String) o).startsWith("smart")) {
+                        smart = true;
+                        break;
+                    }
+                }
+            }
+            if (maxMag > 0) {
+                dzMax100 = clampInt(maxMag * 100, 100, 3200);
+            }
+            if (!smart) {
+                prepLog("dz mode: smart 不在支持表(仍尝试提交)");
+            }
+            try {
+                maxMag = mod.getMaxDigitalZoomMagnification(
+                        CameraEx.ParametersModifier.DIGITAL_ZOOM_TYPE_SMART);
+            } catch (Throwable t) {
+            }
+            if (maxMag > 0) {
+                dzMax100 = clampInt(maxMag * 100, 100, 3200);
+            }
+            mod.setDigitalZoomMode(
+                    CameraEx.ParametersModifier.DIGITAL_ZOOM_TYPE_SMART, true);
+            cam.setParameters(p);
+            prepLog("dz mode committed max=" + dzMax100);
+            return true;
+        } catch (Throwable t) {
+            prepLog("dz mode fail " + t);
+            return false;
+        }
+    }
 
     /** 浏览中移动选择后 400ms 防抖预览。 */
     private void debouncePreview() {        final int seq = ++applySeq;
@@ -2483,6 +3242,400 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 }
             }
         }, 400);
+    }
+
+    // ---------------- v0.7.0 官方风 LUT 菜单 ----------------
+
+    private void openMenu() {
+        if (menuOpen) {
+            return;
+        }
+        menuOpen = true;
+        menuSel = Math.min(appliedIndex, cubeFiles.size()); // 退出项不作为初始选中
+        lutMenu.setVisibility(View.VISIBLE);
+        lutMenu.invalidate();
+        Log.i(TAG, "menu open sel=" + menuSel);
+        prepLog("menu open");
+    }
+
+    private void closeMenu() {
+        if (!menuOpen) {
+            return;
+        }
+        menuOpen = false;
+        lutMenu.setVisibility(View.GONE);
+        refreshTopBar();
+        Log.i(TAG, "menu close");
+    }
+
+    private void toggleMenu() {
+        if (menuOpen) {
+            closeMenu();
+        } else {
+            openMenu();
+        }
+    }
+
+    /** 菜单选择移动 + 500ms 防抖实时预览（与旧浏览模式同策略：改写已绑定
+     *  表内容是证实安全的热路径；退出项不参与预览）。 */
+    private void menuMove(int delta) {
+        int total = cubeFiles.size() + 2; // OFF + LUTs + 退出
+        menuSel = (menuSel + delta + total) % total;
+        lutMenu.invalidate();
+        if (menuSel <= cubeFiles.size()) {
+            debounceMenuPreview();
+        }
+    }
+
+    private void debounceMenuPreview() {
+        final int seq = ++applySeq;
+        final int target = menuSel;
+        mainHandler.postDelayed(new Runnable() {
+            public void run() {
+                if (seq == applySeq && menuOpen) {
+                    requestApply(target);
+                    lutMenu.invalidate();
+                }
+            }
+        }, 500);
+    }
+
+    /** 菜单显示名：剥掉 cube TITLE 里的 "VLogAlchemy" 前缀与 "(sRGB in)" 后缀。 */
+    private static String prettyName(String title) {
+        String s = title.trim();
+        int paren = s.indexOf('(');
+        if (paren > 0) {
+            s = s.substring(0, paren);
+        }
+        String prefix = "VLogAlchemy ";
+        if (s.length() > prefix.length()
+                && s.substring(0, prefix.length()).equalsIgnoreCase(prefix)) {
+            s = s.substring(prefix.length());
+        }
+        s = s.trim();
+        return s.length() > 0 ? s : title;
+    }
+
+    /** 文件名 → 大写词干（介绍清单/描述查找键）。 */
+    private static String stemOf(String name) {
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        return base.toUpperCase();
+    }
+
+    /** 读 /LUTS/STYLE.TXT：首词 CLASSIC=回退旧交互（参数模式+焦段拨盘）；
+     *  menukey=NNN 指定呼出菜单的扫描码（缺省 520=Fn）。无文件=简洁模式。 */
+    private void readStyle() {
+        simpleMode = true;
+        menuKeyScan = SCAN_FN;
+        try {
+            File f = new File(LUT_DIR, "STYLE.TXT");
+            if (f.isFile()) {
+                FileInputStream in = new FileInputStream(f);
+                try {
+                    byte[] b = new byte[(int) f.length()];
+                    int n = in.read(b);
+                    String s = new String(b, 0, n > 0 ? n : 0, "UTF-8");
+                    String[] lines = s.split("\n");
+                    for (int i = 0; i < lines.length; i++) {
+                        String line = lines[i].trim();
+                        if (line.length() == 0 || line.startsWith("#")) {
+                            continue;
+                        }
+                        if (line.toUpperCase().startsWith("CLASSIC")) {
+                            simpleMode = false;
+                        }
+                        if (line.toUpperCase().startsWith("MENUKEY")) {
+                            int eq = line.indexOf('=');
+                            if (eq > 0) {
+                                menuKeyScan = Integer.parseInt(
+                                        line.substring(eq + 1).trim());
+                            }
+                        }
+                    }
+                } finally {
+                    in.close();
+                }
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "readStyle failed: " + t);
+        }
+        Log.i(TAG, "style simple=" + simpleMode + " menukey=" + menuKeyScan);
+        prepLog("style simple=" + simpleMode + " menukey=" + menuKeyScan);
+        // /LUTS/RENAME.TXT 内容 OFF = 关闭"LUT 命名"（缺省开启）。
+        // 机制：拍照写盘完成后把 DSC####.JPG/ARW 原地改名 DSC####_LUT名.ext。
+        // 只改文件名不碰内容，但机内媒体库可能要重建后才认识新名字。
+        renameEnabled = true;
+        try {
+            File f = new File(LUT_DIR, "RENAME.TXT");
+            if (f.isFile()) {
+                FileInputStream in = new FileInputStream(f);
+                try {
+                    byte[] b = new byte[(int) f.length()];
+                    int n = in.read(b);
+                    String s = new String(b, 0, n > 0 ? n : 0, "UTF-8")
+                            .trim().toUpperCase();
+                    if (s.startsWith("OFF") || s.startsWith("0")) {
+                        renameEnabled = false;
+                    }
+                } finally {
+                    in.close();
+                }
+            }
+        } catch (Throwable t) {
+        }
+        prepLog("rename=" + renameEnabled);
+    }
+
+    /** /LUTS/LUTS.TXT：每行 "文件名(可带扩展)|介绍"，菜单描述面板数据源。 */
+    private void loadLutDescs() {
+        lutDescs.clear();
+        try {
+            File f = new File(LUT_DIR, "LUTS.TXT");
+            if (!f.isFile()) {
+                return;
+            }
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new FileInputStream(f),
+                            "UTF-8"));
+            try {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.length() == 0 || line.startsWith("#")) {
+                        continue;
+                    }
+                    int bar = line.indexOf('|');
+                    if (bar <= 0) {
+                        continue;
+                    }
+                    String key = stemOf(line.substring(0, bar).trim());
+                    String desc = line.substring(bar + 1).trim();
+                    if (key.length() > 0 && desc.length() > 0) {
+                        lutDescs.put(key, desc);
+                    }
+                }
+            } finally {
+                br.close();
+            }
+            Log.i(TAG, "lut descs loaded: " + lutDescs.size());
+        } catch (Throwable t) {
+            Log.i(TAG, "loadLutDescs failed: " + t);
+        }
+    }
+
+    // ---------------- v0.7.1 回放（回看键） ----------------
+
+    private void togglePlayback() {
+        if (playbackOpen) {
+            closePlayback();
+        } else {
+            openPlayback();
+        }
+    }
+
+    private void openPlayback() {
+        if (playbackOpen) {
+            return;
+        }
+        if (menuOpen) {
+            closeMenu();
+        }
+        playFiles.clear();
+        listPhotos(DCIM_DIR, playFiles, 400);
+        if (playFiles.isEmpty()) {
+            topBarTextTemp("没有可回看的照片", 1500);
+            prepLog("playback empty");
+            return;
+        }
+        playbackOpen = true;
+        playIdx = 0;
+        playView.setVisibility(View.VISIBLE);
+        loadPhoto();
+        Log.i(TAG, "playback open " + playFiles.size() + " photos");
+        prepLog("playback open n=" + playFiles.size());
+    }
+
+    private void closePlayback() {
+        if (!playbackOpen) {
+            return;
+        }
+        playbackOpen = false;
+        playView.setVisibility(View.GONE);
+        playSeq++; // 在途解码作废
+        if (playBmp != null) {
+            playBmp.recycle();
+            playBmp = null;
+        }
+        Log.i(TAG, "playback close");
+    }
+
+    private void playStep(int delta) {
+        if (playFiles.isEmpty()) {
+            return;
+        }
+        playIdx = (playIdx + delta + playFiles.size()) % playFiles.size();
+        loadPhoto();
+    }
+
+    private void loadPhoto() {
+        final int seq = ++playSeq;
+        final File f = playFiles.get(playIdx);
+        playCaption = f.getName() + "  " + (playIdx + 1) + "/"
+                + playFiles.size();
+        playBmp = null;
+        playView.invalidate();
+        worker.post(new Runnable() {
+            public void run() {
+                Bitmap bmp = null;
+                try {
+                    String n = f.getName().toUpperCase();
+                    if (n.endsWith(".JPG")) {
+                        bmp = decodeScaled(f, 1024);
+                    } else {
+                        byte[] jpeg = extractArwThumbnail(f);
+                        if (jpeg != null) {
+                            bmp = BitmapFactory.decodeByteArray(jpeg, 0,
+                                    jpeg.length);
+                        }
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "photo decode failed", t);
+                }
+                final Bitmap fb = bmp;
+                mainHandler.post(new Runnable() {
+                    public void run() {
+                        if (seq != playSeq) {
+                            return; // 已切走/已关闭
+                        }
+                        playBmp = fb;
+                        playView.invalidate();
+                    }
+                });
+            }
+        });
+    }
+
+    /** DCIM 各子目录收集 JPG/ARW，按修改时间倒序，上限 max 个。 */
+    private static void listPhotos(File dcim, List<File> out, int max) {
+        File[] subs = dcim.listFiles();
+        if (subs != null) {
+            for (File sub : subs) {
+                if (!sub.isDirectory()) {
+                    continue;
+                }
+                File[] files = sub.listFiles();
+                if (files == null) {
+                    continue;
+                }
+                for (File f : files) {
+                    if (!f.isFile()) {
+                        continue;
+                    }
+                    String n = f.getName().toUpperCase();
+                    if (n.endsWith(".JPG") || n.endsWith(".ARW")) {
+                        out.add(f);
+                    }
+                }
+            }
+        }
+        Collections.sort(out, new Comparator<File>() {
+            public int compare(File a, File b) {
+                long d = b.lastModified() - a.lastModified();
+                return d > 0 ? 1 : (d < 0 ? -1 : 0);
+            }
+        });
+        while (out.size() > max) {
+            out.remove(out.size() - 1);
+        }
+    }
+
+    /** 解码 JPEG 并降采样（Dalvik 堆有限，整图解码必 OOM）。 */
+    private static Bitmap decodeScaled(File f, int maxDim) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(f.getPath(), o);
+        int sample = 1;
+        while (o.outWidth / (sample * 2) >= maxDim
+                || o.outHeight / (sample * 2) >= maxDim) {
+            sample *= 2;
+        }
+        BitmapFactory.Options o2 = new BitmapFactory.Options();
+        o2.inSampleSize = sample;
+        return BitmapFactory.decodeFile(f.getPath(), o2);
+    }
+
+    /** ARW（TIFF 结构）内嵌 JPEG 缩略图提取：IFD0 找 0x0201 偏移 + 0x0202 长度。 */
+    private static byte[] extractArwThumbnail(File f) {
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(f, "r");
+            if (raf.length() < 16) {
+                return null;
+            }
+            byte[] head = new byte[8];
+            raf.readFully(head);
+            boolean le = head[0] == 'I'; // II=小端，MM=大端
+            int ifd = (int) readU32(head, 4, le);
+            if (ifd <= 0 || ifd >= raf.length()) {
+                return null;
+            }
+            raf.seek(ifd);
+            byte[] cntBuf = new byte[2];
+            raf.readFully(cntBuf);
+            int cnt = readU16(cntBuf, 0, le);
+            if (cnt < 1 || cnt > 512) {
+                return null;
+            }
+            byte[] entries = new byte[cnt * 12];
+            raf.readFully(entries);
+            long jpegOff = -1;
+            long jpegLen = -1;
+            for (int i = 0; i < cnt; i++) {
+                int off = i * 12;
+                int tag = readU16(entries, off, le);
+                if (tag == 0x0201) {
+                    jpegOff = readU32(entries, off + 8, le);
+                } else if (tag == 0x0202) {
+                    jpegLen = readU32(entries, off + 8, le);
+                }
+            }
+            if (jpegOff <= 0 || jpegLen <= 0
+                    || jpegOff + jpegLen > raf.length()) {
+                return null;
+            }
+            raf.seek(jpegOff);
+            byte[] out = new byte[(int) jpegLen];
+            raf.readFully(out);
+            return out;
+        } catch (Throwable t) {
+            Log.i(TAG, "arw thumb extract failed: " + t);
+            return null;
+        } finally {
+            if (raf != null) {
+                try {
+                    raf.close();
+                } catch (Throwable ignore) {
+                }
+            }
+        }
+    }
+
+    private static int readU16(byte[] b, int off, boolean le) {
+        return le ? (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8)
+                : ((b[off] & 0xff) << 8) | (b[off + 1] & 0xff);
+    }
+
+    private static long readU32(byte[] b, int off, boolean le) {
+        long v = le ? ((long) (b[off] & 0xff))
+                | (((long) (b[off + 1] & 0xff)) << 8)
+                | (((long) (b[off + 2] & 0xff)) << 16)
+                | (((long) (b[off + 3] & 0xff)) << 24)
+                : (((long) (b[off] & 0xff)) << 24)
+                | (((long) (b[off + 1] & 0xff)) << 16)
+                | (((long) (b[off + 2] & 0xff)) << 8)
+                | ((long) (b[off + 3] & 0xff));
+        return v & 0xffffffffL;
     }
 
     // 退出状态：exiting 防 MENU 重复触发；displayHandedBack 保证交还显示只做一次

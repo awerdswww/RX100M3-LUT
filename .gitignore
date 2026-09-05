@@ -16,3 +16,18 @@ stubs/
 
 # 系统杂项
 .DS_Store
+
+# 索尼官方应用 jadx 反编译产物（版权原因勿提交）
+offical_apks_src/
+offical_apks/
+
+# 第三方 LUT（许可未知，勿提交；自备文件见 LUTS.TXT 注释）
+luts/GR3X*.CUB
+
+# 改装工具链构建产物
+bridge-work/build/
+
+# 安装器构建产物（只收 installer.py / installer.spec）
+installer/assets/
+installer/build/
+installer/dist/

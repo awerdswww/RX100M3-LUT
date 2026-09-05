@@ -1,0 +1,29 @@
+# LUTS.TXT — LUT 菜单介绍清单（v0.7.0）
+# 格式：文件名(可省扩展名)|介绍文字   # 开头为注释
+# 与 .cube 一起拷到 SD 卡 /LUTS/ 目录；缺介绍时菜单显示默认文案。
+# 2026-09-05 欧版机无中文字库：介绍文案改用日文汉字（JIS X 0208 全覆盖），
+# 简体独有字形（调/饱/黑/胶…）替换为日文字形（調/飽/黒/膠…）。
+ACROS.CUB|富士 NEOPAN ACROS 白黒。超微細顆粒的銀塩風格，黒位乾浄、高光柔和，経典紀実白黒。
+ARRI.CUB|ARRI Alexa 影視機色彩。高光温柔圧縮（白位 0.74），肌色柔和，寛厚電影感。
+ASTIA.CUB|富士 ASTIA。低反差柔和肌色，飽和適中偏暖，人像與街拍首選。
+CCHROME.CUB|Chrome 彩色正片風。温潤通透的直出色彩，紅潤肌色帯軽微暖調。
+CNEG.CUB|彩色負片風。膠片密度厚重，暖調灰色霧感，白位 0.89 柔和不刺眼。
+ETERNA.CUB|富士 ETERNA 電影膠巻。低飽和低反差的影視底色，灰調質感，後期友好。
+ETERNABB.CUB|ETERNA 漂白方案（Bleach Bypass）。低飽和＋硬朗銀感，戦争片色調，衝撃力強。
+F3513DI.CUB|富士 3513 印片/DI 風。黒位上昇 0.03 的膠片印片質感，冷調電影感。
+HBNRGB.CUB|HB 濃郁系・高飽和（sRGB 輸出）。極高飽和度，白位幾乎不圧縮，鮮活濃郁。
+HBSRGB.CUB|HB 濃郁系・柔軟版（sRGB）。飽和度略収的高鮮風格，比 HBN 耐看。
+K2383.CUB|柯達 Vision3 2383 印片模擬。影院膠片経典：黒位微上昇、冷調青感、院線質感。
+LEICACLS.CUB|Leica 経典。白位 0.77 亜光圧縮，徳味暖調，低調而有質感。
+LEICANAT.CUB|Leica 自然。低反差写実質感，白位 0.74 柔和，最接近直出的徳味。
+PRONEG.CUB|富士 PRO Negative。専業負片人像：肌色還原堅実，黒位乾浄，層次豊富。
+PROVIA.CUB|富士 PROVIA 幻灯片。正片通透，色彩平衡中性，風光紀実皆宜。
+REALAACE.CUB|富士 Reala ACE。Reala 細緻底色加 ACE 曲線，暖調自然，日常掛機色。
+REDACHRO.CUB|RED Achromatic 白黒。白位 0.72 圧縮的亜光単色，電影感白黒。
+REDFB.CUB|RED 影視冷調。低飽和偏青的数字電影感，黒位微上昇，冷峻克制。
+REDFBBB.CUB|RED 漂白方案（Bleach Bypass）。全庫最低飽和（0.20），銀塩硬朗，雰囲鋭利。
+REDFBO.CUB|RED 影視暖調。低飽和加暖橙傾向，黄昏與室内灯光場景出色。
+REDMC.CUB|RED 中等反差。均衡的数字電影風：暖調、中度飽和、高光抑制。
+VELVIA.CUB|富士 VELVIA。風光経典高飽和（0.67），濃郁緑色與深藍，膠片周期的王者。
+GR3XNEG.CUB|理光 GR3X 負片模擬。中低飽和冷調負片味，反差柔和層次綿密，日常掛機理光色。
+GR3XPOSI.CUB|理光 GR3X 正片模擬。高飽和暖調正片感，通透濃郁，理光招牌的 SNAPSHOT 色彩。
